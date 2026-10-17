@@ -1,0 +1,9 @@
+[package]
+name = "hinagata"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Registry for classical ML models: versions, signatures, lineage, stages, deployment descriptors and drift monitoring."
+publish = false
+
+[dependencies]
