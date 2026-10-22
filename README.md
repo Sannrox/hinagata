@@ -9,6 +9,15 @@ Hinagata is a standalone registry for classical machine learning models, written
 
 Hinagata doesn't make governance decisions. A caller in front of it enforces policy. It stores artifacts on local disk or S3-compatible object storage, and runs as a single binary with no runtime network calls.
 
+## Run
+
+One listener serves gRPC (`hinagata.v1.Hinagata`, see `proto/hinagata/v1/`) and HTTP/JSON (`GET /v1/identity`). Every call resolves its namespace from the caller's bearer credential, never from the request. Configure one auth hook:
+
+- `HINAGATA_STATIC_TOKEN_FILE` and `HINAGATA_STATIC_NAMESPACE` for standalone or development use;
+- `HINAGATA_JWKS_FILE` and `HINAGATA_JWT_AUDIENCE` (optionally `HINAGATA_JWT_ISSUER`, `HINAGATA_TENANT_CLAIM`) to verify JWTs offline against a local JWKS, with the tenant claim as namespace.
+
+`HINAGATA_LISTEN` sets the address (default `127.0.0.1:7700`). `HINAGATA_TLS_CERT` and `HINAGATA_TLS_KEY` serve TLS; adding `HINAGATA_TLS_CLIENT_CA` requires client certificates.
+
 Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues for planned work.
 
 License: Apache-2.0.

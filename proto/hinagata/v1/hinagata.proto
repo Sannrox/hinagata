@@ -1,0 +1,20 @@
+// Hinagata API, version 1. gRPC is the primary surface; the same messages
+// serve the HTTP/JSON surface. Requests never carry a namespace: it comes
+// from the caller's credential alone.
+syntax = "proto3";
+
+package hinagata.v1;
+
+service Hinagata {
+  // The identity the caller's credential resolves to.
+  rpc GetIdentity(GetIdentityRequest) returns (GetIdentityResponse);
+}
+
+message GetIdentityRequest {}
+
+message GetIdentityResponse {
+  // The namespace every call by this caller acts in.
+  string namespace = 1;
+  // The credential's subject; empty when it names none.
+  string subject = 2;
+}

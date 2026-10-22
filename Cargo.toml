@@ -7,3 +7,25 @@ description = "Registry for classical ML models: versions, signatures, lineage, 
 publish = false
 
 [dependencies]
+axum = "0.8"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+prost = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-connect-info"] }
+tonic-prost = "0.14"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+base64 = "0.22"
+rcgen = "0.14"
+tokio = { version = "1", features = ["io-util"] }
