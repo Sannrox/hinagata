@@ -38,3 +38,9 @@ boon = "0.6.1"
 rcgen = "0.14"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["io-util"] }
+
+# Dependencies build without debug info in dev and test builds: backtraces
+# and debuggers keep full detail for workspace crates, and build directories
+# stay a fraction of the size.
+[profile.dev.package."*"]
+debug = false
