@@ -50,6 +50,9 @@ async fn run() -> Result<(), String> {
     if let Some(signer) = config::signer(var)? {
         api = api.with_signer(signer);
     }
+    if let Some(hook) = config::approval_hook(var)? {
+        api = api.with_approval_hook(hook);
+    }
     serve(api, listener, tls, async {
         let _ = tokio::signal::ctrl_c().await;
     })

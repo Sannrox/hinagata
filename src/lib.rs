@@ -6,6 +6,7 @@ pub mod artifacts;
 pub mod auth;
 pub mod config;
 pub mod drift;
+pub mod promotion;
 pub mod quality;
 pub mod registry;
 pub mod signature;

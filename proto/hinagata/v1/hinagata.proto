@@ -26,9 +26,16 @@ service Hinagata {
   rpc ListVersionsTrainedOn(ListVersionsTrainedOnRequest) returns (ListVersionsResponse);
 
   // Move a version between stages: candidate and staging either way, and
-  // either of them to archived, which is final. Production needs an
-  // approval hook and is refused until one is configured.
+  // either of them to archived, which is final. With an approval hook every
+  // change applies only on its allow; without one, production is refused
+  // (docs/promotion.md).
   rpc SetVersionStage(SetVersionStageRequest) returns (Version);
+  // Gates a model requires for promotion to production: metric minimums,
+  // signature compatibility with every version in production, and a signed
+  // manifest. Checked before the approval hook is asked and again when the
+  // change applies.
+  rpc PutPromotionGates(PutPromotionGatesRequest) returns (PromotionGates);
+  rpc GetPromotionGates(GetPromotionGatesRequest) returns (PromotionGates);
 
   // The changes from one version's signature to another's that break a
   // caller of the first: a new input, an input of another type or shape or
@@ -530,4 +537,22 @@ message QualityReport {
   repeated QualityMetric metrics = 3;
   // The alerts this aggregate raised.
   repeated DriftAlert alerts = 4;
+}
+
+message PromotionGates {
+  // Each metric the version must record, at least at this value.
+  map<string, double> min_metrics = 1;
+  // No breaking signature change against any version in production.
+  bool require_compatible_signature = 2;
+  // The registry holds a signing key, so the manifest is signed.
+  bool require_signed_manifest = 3;
+}
+
+message PutPromotionGatesRequest {
+  string model = 1;
+  PromotionGates gates = 2;
+}
+
+message GetPromotionGatesRequest {
+  string model = 1;
 }

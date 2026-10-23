@@ -19,6 +19,10 @@
 //!   1 GiB).
 //! - `HINAGATA_SIGNING_KEY_FILE` (the 32-byte Ed25519 seed as 64 hex
 //!   characters) with `HINAGATA_SIGNING_KEY_ID` signs version manifests.
+//! - `HINAGATA_APPROVAL_URL` asks that approval hook about every stage
+//!   change, sending the bearer token in `HINAGATA_APPROVAL_TOKEN_FILE` when
+//!   set, and waiting `HINAGATA_APPROVAL_TIMEOUT_MS` (default 10 s, at most
+//!   60 s) before denying.
 //! - `HINAGATA_TLS_CERT` and `HINAGATA_TLS_KEY` (PEM) serve over TLS; adding
 //!   `HINAGATA_TLS_CLIENT_CA` requires client certificates (mTLS).
 
@@ -99,6 +103,31 @@ pub fn signer(
         (None, None) => Ok(None),
         _ => Err("signing needs both HINAGATA_SIGNING_KEY_FILE and HINAGATA_SIGNING_KEY_ID".into()),
     }
+}
+
+/// The approval hook, if configured. A token file or timeout without a URL
+/// is refused, so a half-configured hook never goes unnoticed.
+pub fn approval_hook(
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Option<crate::promotion::ApprovalHook>, String> {
+    let token = read(&var, "HINAGATA_APPROVAL_TOKEN_FILE")?;
+    let timeout = var("HINAGATA_APPROVAL_TIMEOUT_MS");
+    let Some(url) = var("HINAGATA_APPROVAL_URL") else {
+        return match (token, timeout) {
+            (None, None) => Ok(None),
+            _ => Err("HINAGATA_APPROVAL_TOKEN_FILE and HINAGATA_APPROVAL_TIMEOUT_MS need HINAGATA_APPROVAL_URL".into()),
+        };
+    };
+    let timeout_ms = match timeout {
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| (1..=60_000).contains(ms))
+            .ok_or("HINAGATA_APPROVAL_TIMEOUT_MS must be 1 to 60000")?,
+        None => 10_000,
+    };
+    crate::promotion::ApprovalHook::new(&url, token, std::time::Duration::from_millis(timeout_ms))
+        .map(Some)
 }
 
 /// The TLS configuration, if any. Any TLS setting without a full server
