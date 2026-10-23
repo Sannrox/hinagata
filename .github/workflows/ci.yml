@@ -72,7 +72,7 @@ jobs:
           docker cp "$id":/etc/ssl/certs/ca-certificates.crt ./ca-certificates.crt
           docker rm "$id"
           test -s ca-certificates.crt
-          file hinagata-static | tee /dev/stderr | grep -q "statically linked"
+          file hinagata-static | tee /dev/stderr | grep -qE "static(ally|-pie) linked"
       - name: It serves with networking disabled
         run: |
           echo ci-token > token
