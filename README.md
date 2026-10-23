@@ -38,6 +38,10 @@ Model artifacts are content-addressed: stored once by SHA-256 on local disk (`HI
 
 A namespace reads only artifacts it uploaded, and a version can only name an artifact its namespace stored. Artifact bytes are gRPC only. Calling `BeginArtifactUpload` for a stored artifact whose bytes no longer verify reopens the upload, so its namespace can send them again. A failed write aborts its multipart upload; for uploads left unfinished by a crashed process, give the bucket a lifecycle rule that aborts incomplete multipart uploads.
 
+## Drift monitoring
+
+A version can register a training baseline: per-feature bin edges and counts, per-category counts, and the outputs' distributions, with PSI and KS alert thresholds. Serving and batch scoring send prediction summaries in those bins ([format](docs/prediction-summary.md), no raw rows). Each summary gets PSI and binned KS per feature and output, and every value at or above a threshold becomes a drift alert with its evidence.
+
 | HTTP | gRPC |
 | --- | --- |
 | `GET /v1/identity` | `GetIdentity` |
@@ -47,6 +51,9 @@ A namespace reads only artifacts it uploaded, and a version can only name an art
 | `GET /v1/models/{model}/versions/{version}` | `GetVersion` |
 | `GET /v1/lineage/trained-on?dataset_id=…&digest=…` | `ListVersionsTrainedOn` |
 | `POST /v1/models/{model}/versions/{version}/stage` | `SetVersionStage` |
+| `POST /v1/models/{model}/versions/{version}/drift-baseline` | `PutDriftBaseline` |
+| `POST /v1/models/{model}/versions/{version}/prediction-summaries` | `SubmitPredictionSummary` |
+| `GET /v1/drift-alerts` | `ListDriftAlerts` |
 | `GET /v1/audit-events` | `ListAuditEvents` |
 
 Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues for planned work.

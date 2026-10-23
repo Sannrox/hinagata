@@ -4,6 +4,7 @@
 
 use crate::artifacts::{ArtifactError, ArtifactStore, MAX_CHUNK_BYTES};
 use crate::auth::{AuthError, Authenticator, Identity, bearer};
+use crate::drift;
 use crate::registry::{self, Actor, Registry, RegistryError, Stage};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -647,6 +648,93 @@ impl Api {
         Ok(version_out(version))
     }
 
+    pub fn put_drift_baseline(
+        &self,
+        authorization: Option<&str>,
+        request: proto::PutDriftBaselineRequest,
+    ) -> Result<proto::PutDriftBaselineResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let baseline = request.baseline.unwrap_or_default();
+        let thresholds = request.thresholds.unwrap_or_default();
+        self.registry.put_drift_baseline(
+            actor(&identity),
+            &request.model,
+            request.version,
+            &drift::Baseline {
+                features: distributions_in(baseline.features)?,
+                outputs: distributions_in(baseline.outputs)?,
+            },
+            drift::Thresholds {
+                psi: thresholds.psi,
+                ks: thresholds.ks,
+            },
+        )?;
+        Ok(proto::PutDriftBaselineResponse {})
+    }
+
+    pub fn submit_prediction_summary(
+        &self,
+        authorization: Option<&str>,
+        request: proto::SubmitPredictionSummaryRequest,
+    ) -> Result<proto::DriftReport, ApiError> {
+        let identity = self.identity(authorization)?;
+        let summary = request.summary.unwrap_or_default();
+        if summary.format != drift::SUMMARY_FORMAT {
+            return Err(RegistryError::Invalid(format!(
+                "summary format must be {}",
+                drift::SUMMARY_FORMAT
+            ))
+            .into());
+        }
+        let report = self.registry.submit_prediction_summary(
+            actor(&identity),
+            &request.model,
+            request.version,
+            &drift::Summary {
+                summary_id: summary.summary_id,
+                window_start_ms: summary.window_start_ms,
+                window_end_ms: summary.window_end_ms,
+                prediction_count: summary.prediction_count,
+                latency_p50_ms: summary.latency_p50_ms,
+                latency_p95_ms: summary.latency_p95_ms,
+                features: distributions_in(summary.features)?,
+                outputs: distributions_in(summary.outputs)?,
+            },
+        )?;
+        Ok(proto::DriftReport {
+            summary_id: report.summary_id,
+            drift: report
+                .drift
+                .into_iter()
+                .map(|feature| proto::FeatureDrift {
+                    role: feature.role,
+                    name: feature.name,
+                    psi: feature.psi,
+                    ks: feature.ks,
+                })
+                .collect(),
+            alerts: report.alerts.into_iter().map(alert_out).collect(),
+        })
+    }
+
+    pub fn list_drift_alerts(
+        &self,
+        authorization: Option<&str>,
+        request: proto::ListDriftAlertsRequest,
+    ) -> Result<proto::ListDriftAlertsResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let model = (!request.model.is_empty()).then_some(request.model.as_str());
+        let alerts = self.registry.list_drift_alerts(
+            identity.namespace(),
+            model,
+            request.after_seq,
+            request.limit,
+        )?;
+        Ok(proto::ListDriftAlertsResponse {
+            alerts: alerts.into_iter().map(alert_out).collect(),
+        })
+    }
+
     pub fn list_audit_events(
         &self,
         authorization: Option<&str>,
@@ -675,6 +763,48 @@ impl Api {
                 })
                 .collect(),
         })
+    }
+}
+
+fn distribution_in(
+    name: &str,
+    distribution: proto::Distribution,
+) -> Result<drift::Distribution, ApiError> {
+    use proto::distribution::Bins;
+    match distribution.bins {
+        Some(Bins::Numeric(bins)) => Ok(drift::Distribution::Numeric {
+            edges: bins.edges,
+            counts: bins.counts,
+        }),
+        Some(Bins::Categorical(bins)) => Ok(drift::Distribution::Categorical {
+            counts: bins.counts.into_iter().collect(),
+        }),
+        None => Err(
+            RegistryError::Invalid(format!("`{name}` needs numeric or categorical bins")).into(),
+        ),
+    }
+}
+
+fn distributions_in(
+    set: std::collections::HashMap<String, proto::Distribution>,
+) -> Result<std::collections::BTreeMap<String, drift::Distribution>, ApiError> {
+    set.into_iter()
+        .map(|(name, distribution)| Ok((name.clone(), distribution_in(&name, distribution)?)))
+        .collect()
+}
+
+fn alert_out(alert: drift::DriftAlert) -> proto::DriftAlert {
+    proto::DriftAlert {
+        seq: alert.seq,
+        at_ms: alert.at_ms,
+        model: alert.model,
+        version: alert.version,
+        summary_id: alert.summary_id,
+        role: alert.role,
+        name: alert.name,
+        metric: alert.metric,
+        value: alert.value,
+        threshold: alert.threshold,
     }
 }
 
@@ -743,6 +873,9 @@ grpc_methods! {
     list_versions_trained_on(ListVersionsTrainedOnRequest) -> ListVersionsResponse;
     set_version_stage(SetVersionStageRequest) -> Version;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
+    put_drift_baseline(PutDriftBaselineRequest) -> PutDriftBaselineResponse;
+    submit_prediction_summary(SubmitPredictionSummaryRequest) -> DriftReport;
+    list_drift_alerts(ListDriftAlertsRequest) -> ListDriftAlertsResponse;
     {
         async fn begin_artifact_upload(
             &self,
@@ -902,6 +1035,48 @@ pub fn http_router(api: Api) -> axum::Router {
                  headers: HeaderMap,
                  Query(request): Query<proto::ListVersionsTrainedOnRequest>| async move {
                     call(api, &headers, request, Api::list_versions_trained_on).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/drift-baseline",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Json(request): Json<proto::PutDriftBaselineRequest>| async move {
+                    let request = proto::PutDriftBaselineRequest {
+                        model,
+                        version,
+                        ..request
+                    };
+                    call(api, &headers, request, Api::put_drift_baseline).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/prediction-summaries",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Json(summary): Json<proto::PredictionSummary>| async move {
+                    let request = proto::SubmitPredictionSummaryRequest {
+                        model,
+                        version,
+                        summary: Some(summary),
+                    };
+                    call(api, &headers, request, Api::submit_prediction_summary).await
+                },
+            ),
+        )
+        .route(
+            "/v1/drift-alerts",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Query(request): Query<proto::ListDriftAlertsRequest>| async move {
+                    call(api, &headers, request, Api::list_drift_alerts).await
                 },
             ),
         )

@@ -135,6 +135,7 @@ CREATE TABLE artifact_upload_chunks (
     PRIMARY KEY (upload_id, offset_bytes)
 );
 "#,
+    crate::drift::MIGRATION,
 ];
 
 /// Most items one list call returns.
@@ -437,7 +438,10 @@ impl Registry {
         })
     }
 
-    fn write<T>(&self, apply: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn write<T>(
+        &self,
+        apply: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let mut conn = self
             .conn
             .lock()
@@ -448,7 +452,7 @@ impl Registry {
         Ok(value)
     }
 
-    fn read<T>(&self, apply: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn read<T>(&self, apply: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self
             .conn
             .lock()
@@ -1108,7 +1112,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn page(limit: u32) -> u32 {
+pub(crate) fn page(limit: u32) -> u32 {
     match limit {
         0 => DEFAULT_PAGE,
         limit => limit.min(MAX_PAGE),
@@ -1124,7 +1128,7 @@ fn parse<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn audit(
+pub(crate) fn audit(
     tx: &rusqlite::Transaction<'_>,
     actor: Actor<'_>,
     action: &str,
@@ -1254,7 +1258,12 @@ fn version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Version>> {
     })())
 }
 
-fn load_version(conn: &Connection, namespace: &str, model: &str, version: u64) -> Result<Version> {
+pub(crate) fn load_version(
+    conn: &Connection,
+    namespace: &str,
+    model: &str,
+    version: u64,
+) -> Result<Version> {
     conn.query_row(
         &format!("{VERSION_COLUMNS} WHERE namespace = ?1 AND model = ?2 AND version = ?3"),
         params![namespace, model, version],
@@ -1298,7 +1307,7 @@ fn check_name(what: &str, name: &str) -> Result<()> {
 }
 
 /// SQLite integers are signed; larger numbers are refused as input.
-fn check_number(what: &str, value: u64) -> Result<()> {
+pub(crate) fn check_number(what: &str, value: u64) -> Result<()> {
     if i64::try_from(value).is_err() {
         return Err(RegistryError::Invalid(format!(
             "{what} must be at most {}",
