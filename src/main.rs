@@ -26,7 +26,8 @@ async fn run() -> Result<(), String> {
         "hinagata {} listening on {listen}",
         env!("CARGO_PKG_VERSION")
     );
-    serve(Api::new(auth, registry), listener, tls, async {
+    let artifacts = config::artifact_store(var)?;
+    serve(Api::new(auth, registry, artifacts), listener, tls, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await

@@ -17,8 +17,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const SECRET: &[u8] = b"test-only-hmac-secret-0123456789";
 /// A synthetic batch runner receipt (schema 6) for a training run.
 const RECEIPT: &str = include_str!("fixtures/training-run-receipt.json");
+const MODEL: &[u8] = b"churn model weights v1";
 const MODEL_DIGEST: &str =
-    "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    "sha256:01e362ecda396b3bac2c157f468fa271b1282a836bd7d67e7b0110308c2972a5";
 const ORDERS: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
 fn token(tenant: &str) -> String {
@@ -41,9 +42,19 @@ async fn server() -> String {
     let address = listener.local_addr().unwrap().to_string();
     let auth = Arc::new(Jwt::new(&jwks, "hinagata", None, "tenant").unwrap());
     let registry = Arc::new(Registry::open_in_memory().unwrap());
-    tokio::spawn(serve(Api::new(auth, registry), listener, None, async {
-        std::future::pending::<()>().await
-    }));
+    tokio::spawn(serve(
+        Api::new(
+            auth,
+            registry,
+            Arc::new(hinagata::artifacts::ArtifactStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                1 << 20,
+            )),
+        ),
+        listener,
+        None,
+        async { std::future::pending::<()>().await },
+    ));
     address
 }
 
@@ -68,6 +79,47 @@ async fn get(address: &str, tenant: &str, path: &str) -> (u16, serde_json::Value
     let status = response[9..12].parse().unwrap();
     let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
     (status, serde_json::from_str(body).unwrap_or_default())
+}
+
+/// Upload `bytes` as an artifact of `tenant` and return its digest.
+async fn upload(address: &str, tenant: &str, bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut client = HinagataClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(bytes));
+    let begun = client
+        .begin_artifact_upload(authed(
+            tenant,
+            hinagata::api::proto::BeginArtifactUploadRequest {
+                digest: digest.clone(),
+                size_bytes: bytes.len() as u64,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .upload_artifact_chunk(authed(
+            tenant,
+            hinagata::api::proto::UploadArtifactChunkRequest {
+                upload_id: begun.upload_id.clone(),
+                offset: 0,
+                data: bytes.to_vec(),
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .complete_artifact_upload(authed(
+            tenant,
+            hinagata::api::proto::CompleteArtifactUploadRequest {
+                upload_id: begun.upload_id,
+            },
+        ))
+        .await
+        .unwrap();
+    digest
 }
 
 fn from_receipt(artifact_digest: &str) -> RegisterVersionRequest {
@@ -107,6 +159,7 @@ async fn a_version_registered_from_a_training_receipt_shows_lineage_both_ways() 
         ))
         .await
         .unwrap();
+    assert_eq!(upload(&address, "tenant-a", MODEL).await, MODEL_DIGEST);
     let version = client
         .register_version(authed("tenant-a", from_receipt(MODEL_DIGEST)))
         .await
@@ -183,11 +236,9 @@ async fn a_version_registered_from_a_training_receipt_shows_lineage_both_ways() 
     assert_eq!(body["versions"], serde_json::json!([]));
 
     // A model the run did not produce cannot claim its lineage.
+    let other = upload(&address, "tenant-a", b"another model").await;
     let refused = client
-        .register_version(authed(
-            "tenant-a",
-            from_receipt(&format!("sha256:{}", "7".repeat(64))),
-        ))
+        .register_version(authed("tenant-a", from_receipt(&other)))
         .await
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);

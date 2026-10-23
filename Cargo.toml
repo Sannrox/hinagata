@@ -8,7 +8,10 @@ publish = false
 
 [dependencies]
 axum = "0.8"
+bytes = "1.12.1"
+futures = "0.3.34"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+object_store = { version = "0.14.2", features = ["aws"] }
 prost = "0.14"
 rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -29,4 +32,5 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 base64 = "0.22"
 rcgen = "0.14"
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["io-util"] }

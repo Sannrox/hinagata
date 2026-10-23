@@ -12,14 +12,43 @@
 //!     JWKS file, so the server starts and runs offline.
 //! - `HINAGATA_DB_PATH`: the registry database file, default
 //!   `hinagata.db`. One server owns it.
+//! - Artifacts: `HINAGATA_ARTIFACT_DIR` (default `artifacts`) on local disk,
+//!   or `HINAGATA_S3_BUCKET` for S3-compatible storage, with
+//!   `HINAGATA_S3_ENDPOINT` for a non-AWS store and the standard `AWS_*`
+//!   credentials. `HINAGATA_MAX_ARTIFACT_BYTES` caps one artifact (default
+//!   1 GiB).
 //! - `HINAGATA_TLS_CERT` and `HINAGATA_TLS_KEY` (PEM) serve over TLS; adding
 //!   `HINAGATA_TLS_CLIENT_CA` requires client certificates (mTLS).
 
+use crate::artifacts::{ArtifactStore, DEFAULT_MAX_ARTIFACT_BYTES};
 use crate::auth::{Authenticator, Jwt, StaticToken};
 use std::sync::Arc;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7700";
 pub const DEFAULT_DB_PATH: &str = "hinagata.db";
+pub const DEFAULT_ARTIFACT_DIR: &str = "artifacts";
+
+/// The artifact store the environment configures.
+pub fn artifact_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<ArtifactStore>, String> {
+    let max_bytes = match var("HINAGATA_MAX_ARTIFACT_BYTES") {
+        None => DEFAULT_MAX_ARTIFACT_BYTES,
+        Some(value) => value
+            .parse()
+            .ok()
+            .filter(|bytes| *bytes > 0)
+            .ok_or("HINAGATA_MAX_ARTIFACT_BYTES must be a positive number of bytes")?,
+    };
+    let store = match var("HINAGATA_S3_BUCKET") {
+        Some(bucket) => {
+            ArtifactStore::s3(&bucket, var("HINAGATA_S3_ENDPOINT").as_deref(), max_bytes)?
+        }
+        None => {
+            let dir = var("HINAGATA_ARTIFACT_DIR").unwrap_or_else(|| DEFAULT_ARTIFACT_DIR.into());
+            ArtifactStore::local(std::path::Path::new(&dir), max_bytes)?
+        }
+    };
+    Ok(Arc::new(store))
+}
 
 fn read(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<Option<String>, String> {
     var(name)

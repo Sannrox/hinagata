@@ -2,6 +2,7 @@
 //! protobuf package, on one listener. Every call first resolves its
 //! namespace through the [`Authenticator`]; requests carry none.
 
+use crate::artifacts::{ArtifactError, ArtifactStore, MAX_CHUNK_BYTES};
 use crate::auth::{AuthError, Authenticator, Identity, bearer};
 use crate::registry::{self, Actor, Registry, RegistryError, Stage};
 use axum::Json;
@@ -41,6 +42,7 @@ impl From<RegistryError> for ApiError {
             RegistryError::NotFound(_) => tonic::Code::NotFound,
             RegistryError::Conflict(_) => tonic::Code::AlreadyExists,
             RegistryError::Refused(_) => tonic::Code::FailedPrecondition,
+            RegistryError::TooLarge(_) => tonic::Code::ResourceExhausted,
             RegistryError::Storage(detail) => {
                 // The detail can name the database file; keep it in the log.
                 eprintln!("hinagata: registry storage: {detail}");
@@ -70,6 +72,7 @@ impl IntoResponse for ApiError {
             tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
             tonic::Code::NotFound => StatusCode::NOT_FOUND,
             tonic::Code::AlreadyExists | tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
+            tonic::Code::ResourceExhausted => StatusCode::PAYLOAD_TOO_LARGE,
             tonic::Code::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
@@ -77,11 +80,44 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// The API over one authentication hook and one registry.
+/// The API over one authentication hook, one registry and one artifact
+/// store.
 #[derive(Clone)]
 pub struct Api {
     auth: Arc<dyn Authenticator>,
     registry: Arc<Registry>,
+    artifacts: Arc<ArtifactStore>,
+}
+
+impl From<ArtifactError> for ApiError {
+    fn from(error: ArtifactError) -> Self {
+        let code = match &error {
+            ArtifactError::NotFound => tonic::Code::NotFound,
+            ArtifactError::Corrupt(_) => tonic::Code::DataLoss,
+            ArtifactError::Mismatch(_) => tonic::Code::InvalidArgument,
+            ArtifactError::Storage(detail) => {
+                eprintln!("hinagata: artifact storage: {detail}");
+                return Self {
+                    code: tonic::Code::Unavailable,
+                    message: "the artifact store could not complete the request".into(),
+                };
+            }
+        };
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
+fn upload_status(upload: registry::ArtifactUpload) -> proto::ArtifactUploadStatus {
+    proto::ArtifactUploadStatus {
+        upload_id: upload.upload_id,
+        digest: upload.digest,
+        size_bytes: upload.size_bytes,
+        received_bytes: upload.received_bytes,
+        complete: upload.complete,
+    }
 }
 
 fn now_ms() -> i64 {
@@ -228,8 +264,233 @@ fn version_out(version: registry::Version) -> proto::Version {
 }
 
 impl Api {
-    pub fn new(auth: Arc<dyn Authenticator>, registry: Arc<Registry>) -> Self {
-        Self { auth, registry }
+    pub fn new(
+        auth: Arc<dyn Authenticator>,
+        registry: Arc<Registry>,
+        artifacts: Arc<ArtifactStore>,
+    ) -> Self {
+        Self {
+            auth,
+            registry,
+            artifacts,
+        }
+    }
+
+    /// Open or resume an upload. A stored artifact whose bytes no longer
+    /// verify is reopened, so its namespace can send them again.
+    pub async fn begin_artifact_upload(
+        &self,
+        authorization: Option<String>,
+        request: proto::BeginArtifactUploadRequest,
+    ) -> Result<proto::ArtifactUploadStatus, ApiError> {
+        let identity = self.identity(authorization.as_deref())?;
+        let (registry, namespace, subject, max) = (
+            self.registry.clone(),
+            identity.namespace().to_string(),
+            identity.subject().to_string(),
+            self.artifacts.max_bytes(),
+        );
+        let (digest, size) = (request.digest.clone(), request.size_bytes);
+        let upload = {
+            let (registry, namespace, subject, digest) = (
+                registry.clone(),
+                namespace.clone(),
+                subject.clone(),
+                digest.clone(),
+            );
+            blocking(move || {
+                let actor = Actor {
+                    namespace: &namespace,
+                    subject: &subject,
+                    now_ms: now_ms(),
+                };
+                Ok(registry.begin_artifact_upload(actor, &digest, size, max)?)
+            })
+            .await?
+        };
+        if !upload.complete {
+            return Ok(upload_status(upload));
+        }
+        match self
+            .artifacts
+            .verify(digest.trim_start_matches("sha256:"))
+            .await
+        {
+            Ok(_) => Ok(upload_status(upload)),
+            Err(ArtifactError::NotFound | ArtifactError::Corrupt(_)) => {
+                let upload = blocking(move || {
+                    let actor = Actor {
+                        namespace: &namespace,
+                        subject: &subject,
+                        now_ms: now_ms(),
+                    };
+                    Ok(registry.reopen_artifact_upload(actor, &digest)?)
+                })
+                .await?;
+                Ok(upload_status(upload))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Stage a chunk, then advance the upload past it. Staging first means
+    /// a crash in between leaves the upload where it was, and the chunk is
+    /// sent again.
+    pub async fn upload_artifact_chunk(
+        &self,
+        authorization: Option<String>,
+        request: proto::UploadArtifactChunkRequest,
+    ) -> Result<proto::ArtifactUploadStatus, ApiError> {
+        let identity = self.identity(authorization.as_deref())?;
+        let (registry, namespace, upload_id) = (
+            self.registry.clone(),
+            identity.namespace().to_string(),
+            request.upload_id.clone(),
+        );
+        let (offset, len) = (request.offset, request.data.len());
+        let (stage, attempt) = blocking(move || {
+            Ok(registry.check_artifact_chunk(
+                &namespace,
+                &upload_id,
+                offset,
+                len,
+                MAX_CHUNK_BYTES,
+            )?)
+        })
+        .await?;
+        let key = if stage {
+            Some(
+                self.artifacts
+                    .stage_chunk(&request.upload_id, attempt, offset, request.data.into())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let (registry, namespace) = (self.registry.clone(), identity.namespace().to_string());
+        let upload = blocking(move || {
+            Ok(match key {
+                Some(key) => registry.advance_artifact_upload(
+                    &namespace,
+                    &request.upload_id,
+                    attempt,
+                    offset,
+                    len,
+                    &key,
+                )?,
+                None => registry.get_artifact_upload(&namespace, &request.upload_id)?,
+            })
+        })
+        .await?;
+        Ok(upload_status(upload))
+    }
+
+    /// Hash the staged bytes and store the artifact when they match. A
+    /// mismatch drops the bytes and starts the upload over.
+    pub async fn complete_artifact_upload(
+        &self,
+        authorization: Option<String>,
+        request: proto::CompleteArtifactUploadRequest,
+    ) -> Result<proto::ArtifactUploadStatus, ApiError> {
+        let identity = self.identity(authorization.as_deref())?;
+        let (registry, namespace, upload_id) = (
+            self.registry.clone(),
+            identity.namespace().to_string(),
+            request.upload_id,
+        );
+        let upload = {
+            let (registry, namespace, upload_id) =
+                (registry.clone(), namespace.clone(), upload_id.clone());
+            blocking(move || Ok(registry.get_artifact_upload(&namespace, &upload_id)?)).await?
+        };
+        if upload.complete {
+            // A crash after recording may have left staged bytes behind.
+            self.artifacts
+                .discard_upload(&upload_id, upload.attempt)
+                .await?;
+            return Ok(upload_status(upload));
+        }
+        if upload.received_bytes != upload.size_bytes {
+            return Err(RegistryError::Refused(format!(
+                "the upload holds {} of {} bytes",
+                upload.received_bytes, upload.size_bytes
+            ))
+            .into());
+        }
+        let hex = upload.digest.trim_start_matches("sha256:").to_string();
+        let chunks = {
+            let (registry, namespace, upload_id) =
+                (registry.clone(), namespace.clone(), upload_id.clone());
+            blocking(move || Ok(registry.artifact_upload_chunks(&namespace, &upload_id)?)).await?
+        };
+        // Publish, record, then drop the staged bytes: a crash at any point
+        // leaves an upload that completing again finishes.
+        if let Err(error) = self
+            .artifacts
+            .publish(&chunks, &hex, upload.size_bytes)
+            .await
+        {
+            if matches!(error, ArtifactError::Mismatch(_)) {
+                let (registry, namespace, reset_id) =
+                    (registry.clone(), namespace.clone(), upload_id.clone());
+                let attempt = upload.attempt;
+                blocking(move || {
+                    Ok(registry.reset_artifact_upload(&namespace, &reset_id, attempt)?)
+                })
+                .await?;
+                self.artifacts.discard_upload(&upload_id, attempt).await?;
+            }
+            return Err(error.into());
+        }
+        let subject = identity.subject().to_string();
+        let attempt = upload.attempt;
+        let recorded = {
+            let upload_id = upload_id.clone();
+            blocking(move || {
+                let actor = Actor {
+                    namespace: &namespace,
+                    subject: &subject,
+                    now_ms: now_ms(),
+                };
+                Ok(registry.finish_artifact_upload(actor, &upload_id, attempt)?)
+            })
+            .await?
+        };
+        self.artifacts.discard_upload(&upload_id, attempt).await?;
+        Ok(upload_status(recorded))
+    }
+
+    /// A stored artifact of the caller's namespace, verified before the first
+    /// byte. Another namespace's artifact is `NOT_FOUND`.
+    pub async fn read_artifact(
+        &self,
+        authorization: Option<String>,
+        request: proto::ReadArtifactRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<proto::ArtifactChunk, tonic::Status>>,
+        ApiError,
+    > {
+        use futures::StreamExt;
+        let identity = self.identity(authorization.as_deref())?;
+        let (registry, namespace, digest) = (
+            self.registry.clone(),
+            identity.namespace().to_string(),
+            request.digest.clone(),
+        );
+        blocking(move || Ok(registry.artifact_size(&namespace, &digest)?))
+            .await?
+            .ok_or_else(|| ApiError::from(ArtifactError::NotFound))?;
+        let hex = request.digest.trim_start_matches("sha256:");
+        let stream = self.artifacts.read_verified(hex).await?;
+        Ok(stream
+            .map(|chunk| {
+                chunk
+                    .map(|data| proto::ArtifactChunk {
+                        data: data.to_vec(),
+                    })
+                    .map_err(|error| tonic::Status::from(ApiError::from(error)))
+            })
+            .boxed())
     }
 
     /// The caller's identity from its `authorization` value.
@@ -451,9 +712,10 @@ async fn blocking<T: Send + 'static>(
 /// Each gRPC method calls the [`Api`] method of the same name with the
 /// request's `authorization` metadata, on the blocking pool.
 macro_rules! grpc_methods {
-    ($($method:ident($request:ident) -> $response:ident;)*) => {
+    ($($method:ident($request:ident) -> $response:ident;)* { $($extra:tt)* }) => {
         #[tonic::async_trait]
         impl Hinagata for Api {
+            $($extra)*
             $(
                 async fn $method(
                     &self,
@@ -481,6 +743,46 @@ grpc_methods! {
     list_versions_trained_on(ListVersionsTrainedOnRequest) -> ListVersionsResponse;
     set_version_stage(SetVersionStageRequest) -> Version;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
+    {
+        async fn begin_artifact_upload(
+            &self,
+            request: tonic::Request<proto::BeginArtifactUploadRequest>,
+        ) -> Result<tonic::Response<proto::ArtifactUploadStatus>, tonic::Status> {
+            let auth = metadata_auth(&request);
+            let response = Api::begin_artifact_upload(self, auth, request.into_inner()).await?;
+            Ok(tonic::Response::new(response))
+        }
+
+        type ReadArtifactStream =
+            futures::stream::BoxStream<'static, Result<proto::ArtifactChunk, tonic::Status>>;
+
+        async fn upload_artifact_chunk(
+            &self,
+            request: tonic::Request<proto::UploadArtifactChunkRequest>,
+        ) -> Result<tonic::Response<proto::ArtifactUploadStatus>, tonic::Status> {
+            let auth = metadata_auth(&request);
+            let response = Api::upload_artifact_chunk(self, auth, request.into_inner()).await?;
+            Ok(tonic::Response::new(response))
+        }
+
+        async fn complete_artifact_upload(
+            &self,
+            request: tonic::Request<proto::CompleteArtifactUploadRequest>,
+        ) -> Result<tonic::Response<proto::ArtifactUploadStatus>, tonic::Status> {
+            let auth = metadata_auth(&request);
+            let response = Api::complete_artifact_upload(self, auth, request.into_inner()).await?;
+            Ok(tonic::Response::new(response))
+        }
+
+        async fn read_artifact(
+            &self,
+            request: tonic::Request<proto::ReadArtifactRequest>,
+        ) -> Result<tonic::Response<Self::ReadArtifactStream>, tonic::Status> {
+            let auth = metadata_auth(&request);
+            let stream = Api::read_artifact(self, auth, request.into_inner()).await?;
+            Ok(tonic::Response::new(stream))
+        }
+    }
 }
 
 fn header_auth(headers: &HeaderMap) -> Option<&str> {

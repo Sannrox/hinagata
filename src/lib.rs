@@ -2,6 +2,7 @@
 //! lineage, stages, deployment descriptors and drift monitoring.
 
 pub mod api;
+pub mod artifacts;
 pub mod auth;
 pub mod config;
 pub mod registry;

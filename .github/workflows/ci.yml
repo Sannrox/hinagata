@@ -32,3 +32,29 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --all-targets --locked -- -D warnings
+  s3:
+    name: S3-compatible artifact store
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start an S3-compatible store
+        run: |
+          docker run -d --name s3 -p 9000:9000 \
+            -e MINIO_ROOT_USER=testkey -e MINIO_ROOT_PASSWORD=testsecret123 \
+            minio/minio server /data
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live && break
+            sleep 1
+          done
+          AWS_ACCESS_KEY_ID=testkey AWS_SECRET_ACCESS_KEY=testsecret123 AWS_DEFAULT_REGION=us-east-1 \
+            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://hinagata-test
+      - name: Artifact tests against it
+        run: cargo test --locked --test artifacts
+        env:
+          HINAGATA_REQUIRE_S3: "1"
+          HINAGATA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          HINAGATA_TEST_S3_BUCKET: hinagata-test
+          AWS_ACCESS_KEY_ID: testkey
+          AWS_SECRET_ACCESS_KEY: testsecret123
+          AWS_REGION: us-east-1

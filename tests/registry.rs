@@ -15,7 +15,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SECRET: &[u8] = b"test-only-hmac-secret-0123456789";
-const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const MODEL: &[u8] = b"lightgbm churn model";
+
+fn model_digest() -> String {
+    use sha2::Digest as _;
+    format!("sha256:{:x}", sha2::Sha256::digest(MODEL))
+}
 
 fn jwks() -> String {
     use base64::Engine as _;
@@ -41,9 +46,21 @@ async fn server() -> (String, tokio::sync::oneshot::Sender<()>) {
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let auth = Arc::new(Jwt::new(&jwks(), "hinagata", None, "tenant").unwrap());
     let registry = Arc::new(Registry::open_in_memory().unwrap());
-    tokio::spawn(serve(Api::new(auth, registry), listener, None, async {
-        let _ = stopped.await;
-    }));
+    tokio::spawn(serve(
+        Api::new(
+            auth,
+            registry,
+            Arc::new(hinagata::artifacts::ArtifactStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                1 << 20,
+            )),
+        ),
+        listener,
+        None,
+        async {
+            let _ = stopped.await;
+        },
+    ));
     (address, stop)
 }
 
@@ -80,10 +97,51 @@ async fn http(
     (status, serde_json::from_str(body).unwrap_or_default())
 }
 
+/// Upload `bytes` as an artifact of `tenant` and return its digest.
+async fn upload(address: &str, tenant: &str, bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut client = HinagataClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(bytes));
+    let begun = client
+        .begin_artifact_upload(authed(
+            tenant,
+            hinagata::api::proto::BeginArtifactUploadRequest {
+                digest: digest.clone(),
+                size_bytes: bytes.len() as u64,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .upload_artifact_chunk(authed(
+            tenant,
+            hinagata::api::proto::UploadArtifactChunkRequest {
+                upload_id: begun.upload_id.clone(),
+                offset: 0,
+                data: bytes.to_vec(),
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .complete_artifact_upload(authed(
+            tenant,
+            hinagata::api::proto::CompleteArtifactUploadRequest {
+                upload_id: begun.upload_id,
+            },
+        ))
+        .await
+        .unwrap();
+    digest
+}
+
 fn version_request() -> RegisterVersionRequest {
     RegisterVersionRequest {
         model: "churn".into(),
-        artifact_digest: DIGEST.into(),
+        artifact_digest: model_digest(),
         framework: "lightgbm".into(),
         format: "onnx".into(),
         signature: Some(Signature {
@@ -122,6 +180,7 @@ async fn models_and_versions_stay_in_the_callers_namespace_on_both_surfaces() {
         ))
         .await
         .unwrap();
+    upload(&address, "tenant-a", MODEL).await;
     let version = client
         .register_version(authed("tenant-a", version_request()))
         .await
@@ -139,7 +198,7 @@ async fn models_and_versions_stay_in_the_callers_namespace_on_both_surfaces() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["artifact_digest"], DIGEST);
+    assert_eq!(body["artifact_digest"], model_digest());
     assert_eq!(
         body["signature"]["inputs"][0]["shape"],
         serde_json::json!([-1, 4])
@@ -192,6 +251,7 @@ async fn versions_never_change_and_stage_changes_are_audited() {
     )
     .await;
     assert_eq!(status, 200);
+    upload(&address, "tenant-a", MODEL).await;
     client
         .register_version(authed("tenant-a", version_request()))
         .await

@@ -107,6 +107,34 @@ BEGIN
     SELECT RAISE(ABORT, 'a registered version is never deleted');
 END;
 "#,
+    r#"
+CREATE TABLE artifacts (
+    namespace TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_by TEXT NOT NULL,
+    stored_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (namespace, digest)
+);
+CREATE TABLE artifact_uploads (
+    upload_id TEXT PRIMARY KEY,
+    namespace TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    received_bytes INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    completed INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    UNIQUE (namespace, digest)
+);
+CREATE TABLE artifact_upload_chunks (
+    upload_id TEXT NOT NULL,
+    offset_bytes INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    PRIMARY KEY (upload_id, offset_bytes)
+);
+"#,
 ];
 
 /// Most items one list call returns.
@@ -124,6 +152,8 @@ pub enum RegistryError {
     Conflict(String),
     /// The change is not allowed from the current state.
     Refused(String),
+    /// Larger than a configured limit.
+    TooLarge(String),
     Storage(String),
 }
 
@@ -134,6 +164,7 @@ impl std::fmt::Display for RegistryError {
             | Self::NotFound(message)
             | Self::Conflict(message)
             | Self::Refused(message)
+            | Self::TooLarge(message)
             | Self::Storage(message) => f.write_str(message),
         }
     }
@@ -354,6 +385,20 @@ pub struct AuditEvent {
     pub after: Option<String>,
 }
 
+/// An artifact upload session: one per namespace and digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactUpload {
+    pub upload_id: String,
+    pub digest: String,
+    pub size_bytes: u64,
+    pub received_bytes: u64,
+    /// Bumped whenever the upload starts over, so staged bytes and cleanup
+    /// of one attempt never touch another.
+    pub attempt: u64,
+    /// The upload's bytes verified and the artifact is recorded.
+    pub complete: bool,
+}
+
 /// Who acts and when. The API fills it from the authenticated identity.
 #[derive(Debug, Clone, Copy)]
 pub struct Actor<'a> {
@@ -512,6 +557,14 @@ impl Registry {
                     )))
                 };
             }
+            // Only a new version must name a stored artifact, so retrying a
+            // registration from before artifacts were stored still answers.
+            if artifact_size(tx, actor.namespace, &new.artifact_digest)?.is_none() {
+                return Err(RegistryError::Refused(format!(
+                    "artifact {} is not stored in this namespace; upload it first",
+                    new.artifact_digest
+                )));
+            }
             let next: u64 = tx.query_row(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM versions WHERE namespace = ?1 AND model = ?2",
                 params![actor.namespace, model],
@@ -607,6 +660,324 @@ impl Registry {
                 .map(|row| row?)
                 .collect()
         })
+    }
+
+    /// Open, resume or correct the namespace's upload of `digest`. An
+    /// artifact the namespace already stored comes back complete, unless a
+    /// repair of it is under way, which comes back as it stands. An upload
+    /// that never completed may restart with a corrected size.
+    pub fn begin_artifact_upload(
+        &self,
+        actor: Actor<'_>,
+        digest: &str,
+        size_bytes: u64,
+        max_bytes: u64,
+    ) -> Result<ArtifactUpload> {
+        if !is_digest(digest) {
+            return Err(RegistryError::Invalid(format!(
+                "digest `{digest}` must be sha256:<64 lowercase hex>"
+            )));
+        }
+        if size_bytes == 0 || size_bytes > max_bytes {
+            return Err(RegistryError::TooLarge(format!(
+                "size_bytes must be between 1 and the artifact limit of {max_bytes}"
+            )));
+        }
+        check_number("size_bytes", size_bytes)?;
+        let upload_id = artifact_upload_id(actor.namespace, digest);
+        self.write(|tx| {
+            let recorded = artifact_size(tx, actor.namespace, digest)?;
+            if recorded.is_some_and(|stored| stored != size_bytes) {
+                return Err(RegistryError::Conflict(format!(
+                    "artifact {digest} is stored with {} bytes",
+                    recorded.unwrap_or_default()
+                )));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO artifact_uploads (upload_id, namespace, digest, size_bytes,
+                     received_bytes, attempt, completed, created_by, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
+                params![
+                    upload_id,
+                    actor.namespace,
+                    digest,
+                    size_bytes,
+                    if recorded.is_some() { size_bytes } else { 0 },
+                    recorded.is_some(),
+                    actor.subject,
+                    actor.now_ms
+                ],
+            )?;
+            let upload = load_artifact_upload(tx, actor.namespace, &upload_id)?;
+            if upload.size_bytes != size_bytes && !upload.complete {
+                // Only an upload that never stored anything can change size.
+                tx.execute(
+                    "UPDATE artifact_uploads SET size_bytes = ?2, received_bytes = 0,
+                         attempt = attempt + 1 WHERE upload_id = ?1",
+                    params![upload_id, size_bytes],
+                )?;
+                tx.execute(
+                    "DELETE FROM artifact_upload_chunks WHERE upload_id = ?1",
+                    params![upload_id],
+                )?;
+                return load_artifact_upload(tx, actor.namespace, &upload_id);
+            }
+            Ok(upload)
+        })
+    }
+
+    /// Reopen the namespace's completed upload of a stored artifact whose
+    /// bytes no longer verify, so it can send them again. The record stays;
+    /// the upload is incomplete until the new bytes verify. A repair already
+    /// under way is returned as it stands.
+    pub fn reopen_artifact_upload(&self, actor: Actor<'_>, digest: &str) -> Result<ArtifactUpload> {
+        let upload_id = artifact_upload_id(actor.namespace, digest);
+        self.write(|tx| {
+            if artifact_size(tx, actor.namespace, digest)?.is_none() {
+                return Err(RegistryError::NotFound(format!(
+                    "artifact {digest} is not stored in this namespace"
+                )));
+            }
+            tx.execute(
+                "UPDATE artifact_uploads SET received_bytes = 0, completed = 0,
+                     attempt = attempt + 1 WHERE upload_id = ?1 AND completed = 1",
+                params![upload_id],
+            )?;
+            tx.execute(
+                "DELETE FROM artifact_upload_chunks WHERE upload_id = ?1
+                   AND (SELECT completed FROM artifact_uploads WHERE upload_id = ?1) = 0
+                   AND (SELECT received_bytes FROM artifact_uploads WHERE upload_id = ?1) = 0",
+                params![upload_id],
+            )?;
+            load_artifact_upload(tx, actor.namespace, &upload_id)
+        })
+    }
+
+    pub fn get_artifact_upload(&self, namespace: &str, upload_id: &str) -> Result<ArtifactUpload> {
+        self.read(|conn| load_artifact_upload(conn, namespace, upload_id))
+    }
+
+    /// Whether a chunk at `offset` must be staged (`false` for a retried
+    /// chunk the upload already holds), and the attempt to stage it under.
+    /// Any other offset than the received one is refused, naming where to
+    /// continue.
+    pub fn check_artifact_chunk(
+        &self,
+        namespace: &str,
+        upload_id: &str,
+        offset: u64,
+        len: usize,
+        max_chunk: usize,
+    ) -> Result<(bool, u64)> {
+        check_number("offset", offset)?;
+        let upload = self.get_artifact_upload(namespace, upload_id)?;
+        if upload.complete {
+            return Err(RegistryError::Refused("the upload is complete".into()));
+        }
+        if len == 0 || len > max_chunk {
+            return Err(RegistryError::Invalid(format!(
+                "a chunk holds 1 to {max_chunk} bytes"
+            )));
+        }
+        let end = offset.saturating_add(len as u64);
+        if end <= upload.received_bytes {
+            return Ok((false, upload.attempt));
+        }
+        if offset != upload.received_bytes {
+            return Err(RegistryError::Refused(format!(
+                "the upload continues at offset {}",
+                upload.received_bytes
+            )));
+        }
+        if end > upload.size_bytes {
+            return Err(RegistryError::TooLarge(format!(
+                "the chunk passes the declared size of {} bytes",
+                upload.size_bytes
+            )));
+        }
+        Ok((true, upload.attempt))
+    }
+
+    /// Accept the chunk staged at `key` for `offset` and advance the upload
+    /// past it, if the upload is still at that attempt and offset. A
+    /// concurrent retry that already advanced it is not an error, and its
+    /// chunk stays the one accepted.
+    pub fn advance_artifact_upload(
+        &self,
+        namespace: &str,
+        upload_id: &str,
+        attempt: u64,
+        offset: u64,
+        len: usize,
+        key: &str,
+    ) -> Result<ArtifactUpload> {
+        let end = offset + len as u64;
+        self.write(|tx| {
+            let advanced = tx.execute(
+                "UPDATE artifact_uploads SET received_bytes = ?5
+                 WHERE namespace = ?1 AND upload_id = ?2 AND attempt = ?3
+                   AND received_bytes = ?4 AND completed = 0",
+                params![namespace, upload_id, attempt, offset, end],
+            )?;
+            if advanced == 1 {
+                tx.execute(
+                    "INSERT OR REPLACE INTO artifact_upload_chunks (upload_id, offset_bytes, key)
+                     VALUES (?1, ?2, ?3)",
+                    params![upload_id, offset, key],
+                )?;
+            }
+            let upload = load_artifact_upload(tx, namespace, upload_id)?;
+            if upload.attempt != attempt || upload.received_bytes < end {
+                return Err(RegistryError::Refused(format!(
+                    "the upload continues at offset {}",
+                    upload.received_bytes
+                )));
+            }
+            Ok(upload)
+        })
+    }
+
+    /// The chunks accepted for an upload's current attempt, in offset order.
+    pub fn artifact_upload_chunks(
+        &self,
+        namespace: &str,
+        upload_id: &str,
+    ) -> Result<Vec<crate::artifacts::StagedChunk>> {
+        self.read(|conn| {
+            load_artifact_upload(conn, namespace, upload_id)?;
+            let mut statement = conn.prepare(
+                "SELECT offset_bytes, key FROM artifact_upload_chunks
+                 WHERE upload_id = ?1 ORDER BY offset_bytes",
+            )?;
+            let chunks = statement
+                .query_map(params![upload_id], |row| {
+                    Ok(crate::artifacts::StagedChunk {
+                        offset: row.get(0)?,
+                        key: row.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(chunks)
+        })
+    }
+
+    /// Start `attempt` over after its bytes did not match. A later attempt
+    /// is left alone.
+    pub fn reset_artifact_upload(
+        &self,
+        namespace: &str,
+        upload_id: &str,
+        attempt: u64,
+    ) -> Result<()> {
+        self.write(|tx| {
+            let reset = tx.execute(
+                "UPDATE artifact_uploads SET received_bytes = 0, attempt = attempt + 1
+                 WHERE namespace = ?1 AND upload_id = ?2 AND attempt = ?3 AND completed = 0",
+                params![namespace, upload_id, attempt],
+            )?;
+            if reset == 1 {
+                tx.execute(
+                    "DELETE FROM artifact_upload_chunks WHERE upload_id = ?1",
+                    params![upload_id],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Complete `attempt` of an upload whose bytes verified: only if it is
+    /// still that attempt, at that size, with every byte received. Records
+    /// the artifact for the namespace in the same transaction.
+    pub fn finish_artifact_upload(
+        &self,
+        actor: Actor<'_>,
+        upload_id: &str,
+        attempt: u64,
+    ) -> Result<ArtifactUpload> {
+        self.write(|tx| {
+            let upload = load_artifact_upload(tx, actor.namespace, upload_id)?;
+            if upload.complete && upload.attempt == attempt {
+                return Ok(upload);
+            }
+            let finished = tx.execute(
+                "UPDATE artifact_uploads SET completed = 1
+                 WHERE namespace = ?1 AND upload_id = ?2 AND attempt = ?3 AND completed = 0
+                   AND received_bytes = size_bytes",
+                params![actor.namespace, upload_id, attempt],
+            )?;
+            if finished == 0 {
+                return Err(RegistryError::Refused(
+                    "the upload changed while it completed; check its status and complete again"
+                        .into(),
+                ));
+            }
+            if artifact_size(tx, actor.namespace, &upload.digest)?.is_none() {
+                tx.execute(
+                    "INSERT INTO artifacts (namespace, digest, size_bytes, stored_by, stored_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        actor.namespace,
+                        upload.digest,
+                        upload.size_bytes,
+                        actor.subject,
+                        actor.now_ms
+                    ],
+                )?;
+                let record =
+                    serde_json::json!({"digest": upload.digest, "size_bytes": upload.size_bytes});
+                audit(
+                    tx,
+                    actor,
+                    "artifact.stored",
+                    "",
+                    0,
+                    None::<&serde_json::Value>,
+                    Some(&record),
+                )?;
+            }
+            load_artifact_upload(tx, actor.namespace, upload_id)
+        })
+    }
+
+    /// Record that the namespace stored `digest` and complete its upload;
+    /// recording it again is a no-op. Audited as `artifact.stored`.
+    pub fn record_artifact(&self, actor: Actor<'_>, digest: &str, size_bytes: u64) -> Result<()> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE artifact_uploads SET completed = 1, received_bytes = size_bytes
+                 WHERE namespace = ?1 AND digest = ?2",
+                params![actor.namespace, digest],
+            )?;
+            if artifact_size(tx, actor.namespace, digest)?.is_some() {
+                return Ok(());
+            }
+            tx.execute(
+                "INSERT INTO artifacts (namespace, digest, size_bytes, stored_by, stored_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    actor.namespace,
+                    digest,
+                    size_bytes,
+                    actor.subject,
+                    actor.now_ms
+                ],
+            )?;
+            let record = serde_json::json!({"digest": digest, "size_bytes": size_bytes});
+            audit(
+                tx,
+                actor,
+                "artifact.stored",
+                "",
+                0,
+                None::<&serde_json::Value>,
+                Some(&record),
+            )
+        })
+    }
+
+    /// The size of `digest` if the namespace stored it.
+    pub fn artifact_size(&self, namespace: &str, digest: &str) -> Result<Option<u64>> {
+        self.read(|conn| artifact_size(conn, namespace, digest))
     }
 
     /// Versions in the namespace trained on `dataset_id`, at `digest` when it
@@ -777,6 +1148,51 @@ fn audit(
         ],
     )?;
     Ok(())
+}
+
+/// One session per namespace and digest.
+fn artifact_upload_id(namespace: &str, digest: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    for part in [namespace, digest] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("upload-{:x}", hasher.finalize())[..39].to_string()
+}
+
+fn artifact_size(conn: &Connection, namespace: &str, digest: &str) -> Result<Option<u64>> {
+    Ok(conn
+        .query_row(
+            "SELECT size_bytes FROM artifacts WHERE namespace = ?1 AND digest = ?2",
+            params![namespace, digest],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn load_artifact_upload(
+    conn: &Connection,
+    namespace: &str,
+    upload_id: &str,
+) -> Result<ArtifactUpload> {
+    conn.query_row(
+        "SELECT digest, size_bytes, received_bytes, attempt, completed FROM artifact_uploads
+         WHERE namespace = ?1 AND upload_id = ?2",
+        params![namespace, upload_id],
+        |row| {
+            Ok(ArtifactUpload {
+                upload_id: upload_id.into(),
+                digest: row.get(0)?,
+                size_bytes: row.get(1)?,
+                received_bytes: row.get(2)?,
+                attempt: row.get(3)?,
+                complete: row.get(4)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or_else(|| RegistryError::NotFound("artifact upload not found".into()))
 }
 
 fn model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
@@ -1077,8 +1493,29 @@ mod tests {
         }
     }
 
+    /// Store every digest the tests register in `namespace`.
+    fn store_test_artifacts(registry: &Registry, namespace: &str) {
+        let digests = std::iter::once(DIGEST.to_string()).chain("bcdef".chars().map(digest));
+        for digest in digests {
+            registry
+                .record_artifact(actor(namespace), &digest, 1)
+                .unwrap();
+        }
+    }
+
+    /// Registry events, without the artifact records the tests seed.
+    fn registry_events(registry: &Registry, namespace: &str) -> Vec<AuditEvent> {
+        registry
+            .list_audit_events(namespace, None, 0, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.action != "artifact.stored")
+            .collect()
+    }
+
     fn registry_with_version() -> Registry {
         let registry = Registry::open_in_memory().unwrap();
+        store_test_artifacts(&registry, "a");
         registry.create_model(actor("a"), "churn", "").unwrap();
         registry
             .register_version(actor("a"), "churn", new_version(DIGEST))
@@ -1135,10 +1572,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.version, 2);
         // Two creations, two registrations: retries record nothing.
-        assert_eq!(
-            registry.list_audit_events("a", None, 0, 0).unwrap().len(),
-            3
-        );
+        assert_eq!(registry_events(&registry, "a").len(), 3);
     }
 
     #[test]
@@ -1243,6 +1677,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        store_test_artifacts(&registry, "b");
         // The same name in another namespace is a different model.
         registry
             .create_model(actor("b"), "churn", "theirs")
