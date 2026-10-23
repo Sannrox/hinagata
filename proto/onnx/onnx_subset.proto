@@ -1,0 +1,46 @@
+// The part of the ONNX model format Hinagata reads: the graph's inputs and
+// outputs with their element types and shapes. Field numbers match the
+// published ONNX schema, so a full model file decodes against this subset;
+// every other field is skipped.
+syntax = "proto3";
+
+package onnx;
+
+message ModelProto {
+  GraphProto graph = 7;
+}
+
+message GraphProto {
+  repeated TensorProto initializer = 5;
+  repeated ValueInfoProto input = 11;
+  repeated ValueInfoProto output = 12;
+}
+
+message TensorProto {
+  string name = 8;
+}
+
+message ValueInfoProto {
+  string name = 1;
+  TypeProto type = 2;
+}
+
+message TypeProto {
+  message Tensor {
+    int32 elem_type = 1;
+    TensorShapeProto shape = 2;
+  }
+  oneof value {
+    Tensor tensor_type = 1;
+  }
+}
+
+message TensorShapeProto {
+  message Dimension {
+    oneof value {
+      int64 dim_value = 1;
+      string dim_param = 2;
+    }
+  }
+  repeated Dimension dim = 1;
+}

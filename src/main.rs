@@ -27,9 +27,28 @@ async fn run() -> Result<(), String> {
         env!("CARGO_PKG_VERSION")
     );
     let artifacts = config::artifact_store(var)?;
-    serve(Api::new(auth, registry, artifacts), listener, tls, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    let setup = hinagata::api::Setup {
+        auth: if var("HINAGATA_STATIC_TOKEN_FILE").is_some() {
+            "static_token".into()
+        } else {
+            "jwt".into()
+        },
+        artifact_store: if var("HINAGATA_S3_BUCKET").is_some() {
+            "s3".into()
+        } else {
+            "local".into()
+        },
+        tls: tls.is_some(),
+        mutual_tls: var("HINAGATA_TLS_CLIENT_CA").is_some(),
+    };
+    serve(
+        Api::new(auth, registry, artifacts).with_setup(setup),
+        listener,
+        tls,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
     .await
     .map_err(|error| error.to_string())
 }

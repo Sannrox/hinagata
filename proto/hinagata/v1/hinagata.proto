@@ -30,6 +30,12 @@ service Hinagata {
   // approval hook and is refused until one is configured.
   rpc SetVersionStage(SetVersionStageRequest) returns (Version);
 
+  // The changes from one version's signature to another's that break a
+  // caller of the first: a new input, an input of another type or shape or
+  // that no longer accepts null, a removed output or one of another type or
+  // shape. Check before promoting the second.
+  rpc CheckSignatureCompatibility(CheckSignatureCompatibilityRequest) returns (CheckSignatureCompatibilityResponse);
+
   // Artifacts are content-addressed bytes, stored once and read only by
   // namespaces that uploaded them. An upload begins with the digest and
   // size, takes chunks of up to 1 MiB at `received_bytes` (a resent chunk is
@@ -126,6 +132,43 @@ message Version {
   string created_by = 11;
   // What produced the version. Fixed at registration like the rest.
   Lineage lineage = 12;
+  // The dataset schema or object type its inputs read from.
+  SignatureBinding binding = 13;
+}
+
+message BindingField {
+  string name = 1;
+  // A signature dtype, such as int64 or float32.
+  string dtype = 2;
+  bool nullable = 3;
+}
+
+message InputFields {
+  repeated string fields = 1;
+}
+
+// The target a version's inputs read from, given inline (Hinagata fetches
+// nothing). Each input takes the field of its own name, or the fields listed
+// under `inputs`: one for a [batch] input, n in order for a [batch, n] one.
+// A field must widen to the input's type without loss, and a nullable field
+// cannot feed an input that does not accept null.
+message SignatureBinding {
+  // `dataset` or `object_type`.
+  string target_kind = 1;
+  string target = 2;
+  repeated BindingField fields = 3;
+  map<string, InputFields> inputs = 4;
+}
+
+message CheckSignatureCompatibilityRequest {
+  string model = 1;
+  uint64 from_version = 2;
+  uint64 to_version = 3;
+}
+
+message CheckSignatureCompatibilityResponse {
+  bool compatible = 1;
+  repeated string breaking = 2;
 }
 
 message DatasetVersion {
@@ -169,6 +212,9 @@ message RegisterVersionRequest {
   // commit and parameters but not datasets. The receipt must list
   // `artifact_digest` among its outputs.
   string training_run_receipt_json = 9;
+  // Omit the signature of an ONNX artifact to read it from the model graph;
+  // a given one must match the graph.
+  SignatureBinding binding = 10;
 }
 
 message GetVersionRequest {

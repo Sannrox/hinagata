@@ -192,6 +192,15 @@ async fn scenarios(raw: Arc<dyn ObjectStore>) {
         artifact_digest: artifact_digest.into(),
         framework: "xgboost".into(),
         format: "onnx".into(),
+        signature: Some(hinagata::api::proto::Signature {
+            inputs: vec![hinagata::api::proto::TensorSpec {
+                name: "features".into(),
+                dtype: "float32".into(),
+                shape: vec![-1, 4],
+                nullable: false,
+            }],
+            outputs: vec![],
+        }),
         ..Default::default()
     };
     client

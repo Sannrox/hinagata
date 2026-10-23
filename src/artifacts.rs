@@ -61,11 +61,18 @@ pub struct StagedChunk {
 pub struct ArtifactStore {
     store: Arc<dyn ObjectStore>,
     max_bytes: u64,
+    /// The directory of a local store: a missing one lists as empty, so
+    /// the health check looks at it directly.
+    local_root: Option<std::path::PathBuf>,
 }
 
 impl ArtifactStore {
     pub fn new(store: Arc<dyn ObjectStore>, max_bytes: u64) -> Self {
-        Self { store, max_bytes }
+        Self {
+            store,
+            max_bytes,
+            local_root: None,
+        }
     }
 
     /// Artifacts under a local directory, created if missing.
@@ -76,7 +83,10 @@ impl ArtifactStore {
         let store = object_store::local::LocalFileSystem::new_with_prefix(dir)
             .map_err(|error| error.to_string())?
             .with_fsync(true);
-        Ok(Self::new(Arc::new(store), max_bytes))
+        Ok(Self {
+            local_root: Some(dir.to_path_buf()),
+            ..Self::new(Arc::new(store), max_bytes)
+        })
     }
 
     /// Artifacts in an S3-compatible bucket. Credentials and region come
@@ -95,6 +105,24 @@ impl ArtifactStore {
 
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    /// Whether the store answers a listing: the health check's storage
+    /// probe. For S3 this also proves the bucket and credentials work.
+    pub async fn health(&self) -> Result<(), ArtifactError> {
+        if let Some(root) = &self.local_root
+            && !root.is_dir()
+        {
+            return Err(ArtifactError::Storage(format!(
+                "the artifact directory {} is gone",
+                root.display()
+            )));
+        }
+        let prefix = StorePath::from("artifacts");
+        match self.store.list(Some(&prefix)).next().await {
+            None | Some(Ok(_)) => Ok(()),
+            Some(Err(error)) => Err(storage(error)),
+        }
     }
 
     fn artifact_path(hex: &str) -> StorePath {
@@ -371,6 +399,16 @@ mod tests {
             .collect()
             .await;
         chunks.concat()
+    }
+
+    #[tokio::test]
+    async fn a_missing_local_root_is_unhealthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("artifacts-root");
+        let store = ArtifactStore::local(&root, 1 << 20).unwrap();
+        assert_eq!(store.health().await, Ok(()));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(store.health().await.is_err());
     }
 
     #[tokio::test]
