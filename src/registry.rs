@@ -136,6 +136,13 @@ CREATE TABLE artifact_upload_chunks (
 );
 "#,
     crate::drift::MIGRATION,
+    r#"
+ALTER TABLE versions ADD COLUMN binding TEXT;
+CREATE TRIGGER versions_binding_is_immutable BEFORE UPDATE OF binding ON versions
+BEGIN
+    SELECT RAISE(ABORT, 'a registered version is immutable');
+END;
+"#,
 ];
 
 /// Most items one list call returns.
@@ -354,6 +361,9 @@ pub struct NewVersion {
     pub metrics: BTreeMap<String, f64>,
     pub tags: BTreeMap<String, String>,
     pub lineage: Lineage,
+    /// The dataset schema or object type the inputs read from, checked
+    /// against the signature at registration.
+    pub binding: Option<crate::signature::Binding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -367,6 +377,7 @@ pub struct Version {
     pub metrics: BTreeMap<String, f64>,
     pub tags: BTreeMap<String, String>,
     pub lineage: Lineage,
+    pub binding: Option<crate::signature::Binding>,
     pub stage: Stage,
     pub created_at_ms: i64,
     pub created_by: String,
@@ -584,14 +595,16 @@ impl Registry {
                 metrics: new.metrics,
                 tags: new.tags,
                 lineage: new.lineage,
+                binding: new.binding,
                 stage: Stage::Candidate,
                 created_at_ms: actor.now_ms,
                 created_by: actor.subject.into(),
             };
             tx.execute(
                 "INSERT INTO versions (namespace, model, version, artifact_digest, framework,
-                     format, signature, metrics, tags, stage, created_at_ms, created_by, lineage)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     format, signature, metrics, tags, stage, created_at_ms, created_by, lineage,
+                     binding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     actor.namespace,
                     version.model,
@@ -606,6 +619,7 @@ impl Registry {
                     version.created_at_ms,
                     version.created_by,
                     json(&version.lineage)?,
+                    version.binding.as_ref().map(json).transpose()?,
                 ],
             )?;
             for dataset in &version.lineage.training_datasets {
@@ -632,6 +646,26 @@ impl Registry {
                 Some(&version),
             )?;
             Ok(version)
+        })
+    }
+
+    /// The version of `model` registered for `digest`, if any.
+    pub fn version_for_artifact(
+        &self,
+        namespace: &str,
+        model: &str,
+        digest: &str,
+    ) -> Result<Option<Version>> {
+        self.read(|conn| {
+            conn.query_row(
+                &format!(
+                    "{VERSION_COLUMNS} WHERE namespace = ?1 AND model = ?2 AND artifact_digest = ?3"
+                ),
+                params![namespace, model, digest],
+                version_row,
+            )
+            .optional()?
+            .transpose()
         })
     }
 
@@ -1221,7 +1255,7 @@ fn load_model(conn: &Connection, namespace: &str, name: &str) -> Result<Option<M
 
 const VERSION_COLUMNS: &str =
     "SELECT model, version, artifact_digest, framework, format, signature,
-    metrics, tags, stage, created_at_ms, created_by, lineage FROM versions";
+    metrics, tags, stage, created_at_ms, created_by, lineage, binding FROM versions";
 
 /// A version row. The outer result is the SQLite read; the inner one parses
 /// the stored JSON and stage.
@@ -1231,6 +1265,7 @@ fn version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Version>> {
     let tags: String = row.get(7)?;
     let stage: String = row.get(8)?;
     let lineage: String = row.get(11)?;
+    let binding: Option<String> = row.get(12)?;
     let (model, version, artifact_digest, framework, format, created_at_ms, created_by) = (
         row.get(0)?,
         row.get(1)?,
@@ -1251,6 +1286,7 @@ fn version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Version>> {
             metrics: parse(&metrics)?,
             tags: parse(&tags)?,
             lineage: parse(&lineage)?,
+            binding: binding.as_deref().map(parse).transpose()?,
             stage: Stage::parse(&stage)?,
             created_at_ms,
             created_by,
@@ -1285,6 +1321,7 @@ fn same_content(stored: &Version, new: &NewVersion) -> bool {
         && stored.metrics == new.metrics
         && stored.tags == new.tags
         && stored.lineage == new.lineage
+        && stored.binding == new.binding
 }
 
 /// Names: 1 to 128 of `A-Z a-z 0-9 . _ -`, starting with a letter or digit.
@@ -1348,9 +1385,23 @@ fn check_new_version(new: &NewVersion) -> Result<()> {
             FORMATS.join(", ")
         )));
     }
+    for (role, specs) in [
+        ("input", &new.signature.inputs),
+        ("output", &new.signature.outputs),
+    ] {
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(spec) = specs.iter().find(|spec| !seen.insert(&spec.name)) {
+            return Err(RegistryError::Invalid(format!(
+                "signature {role} `{}` is declared twice",
+                spec.name
+            )));
+        }
+    }
     let specs = new.signature.inputs.iter().chain(&new.signature.outputs);
     for spec in specs {
-        check_name("signature field", &spec.name)?;
+        // Model tensor names, such as `serving_default/features:0`, are not
+        // registry names.
+        check_reference("signature field", &spec.name, 256)?;
         check_text("dtype", &spec.dtype, 64)?;
         if spec.dtype.is_empty() || spec.shape.iter().any(|dim| *dim < -1) {
             return Err(RegistryError::Invalid(format!(
@@ -1381,7 +1432,19 @@ fn check_new_version(new: &NewVersion) -> Result<()> {
         check_name("tag", key)?;
         check_text("tag value", value, 1024)?;
     }
-    check_lineage(&new.lineage)
+    check_lineage(&new.lineage)?;
+    if let Some(binding) = &new.binding {
+        let problems = crate::signature::check_binding(&new.signature, binding);
+        if !problems.is_empty() {
+            return Err(RegistryError::Invalid(format!(
+                "the signature does not fit {} `{}`: {}",
+                binding.target_kind,
+                binding.target,
+                problems.join("; ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_digest(value: &str) -> bool {
@@ -1499,6 +1562,7 @@ mod tests {
             metrics: BTreeMap::from([("auc".into(), 0.91)]),
             tags: BTreeMap::from([("team".into(), "risk".into())]),
             lineage: Lineage::default(),
+            binding: None,
         }
     }
 
@@ -1701,7 +1765,7 @@ mod tests {
     #[test]
     fn registrations_are_validated() {
         let registry = registry_with_version();
-        let cases: [(&str, Change); 5] = [
+        let cases: [(&str, Change); 6] = [
             ("digest", |v| v.artifact_digest = "sha256:XYZ".into()),
             ("format", |v| v.format = "pickle".into()),
             ("framework", |v| v.framework.clear()),
@@ -1709,6 +1773,10 @@ mod tests {
                 v.metrics.insert("loss".into(), f64::NAN);
             }),
             ("shape", |v| v.signature.inputs[0].shape = vec![-2]),
+            ("duplicate input", |v| {
+                let again = v.signature.inputs[0].clone();
+                v.signature.inputs.push(again);
+            }),
         ];
         for (what, change) in cases {
             let mut new = new_version(&digest('c'));
