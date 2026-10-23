@@ -46,6 +46,15 @@ service Hinagata {
   // docs/signatures.md). FAILED_PRECONDITION when the registry has no
   // signing key.
   rpc GetVersionManifest(GetVersionManifestRequest) returns (VersionManifest);
+  // Admit a version exported from another registry (docs/bundles.md): its
+  // signed manifest is checked against this registry's trusted keys and its
+  // metadata against the manifest, before anything is written. The
+  // artifact must already be stored in the caller's namespace and the model
+  // must exist. It registers as the next version of the manifest's model,
+  // and the source is audited as `version.imported`. With `validate_only`
+  // only the signature and metadata are checked. FAILED_PRECONDITION when
+  // the registry trusts no keys.
+  rpc ImportVersion(ImportVersionRequest) returns (ImportVersionResponse);
 
   rpc CheckSignatureCompatibility(CheckSignatureCompatibilityRequest) returns (CheckSignatureCompatibilityResponse);
 
@@ -555,4 +564,15 @@ message PutPromotionGatesRequest {
 
 message GetPromotionGatesRequest {
   string model = 1;
+}
+
+message ImportVersionRequest {
+  // The source registry's `GetVersionManifest` response.
+  VersionManifest manifest = 1;
+  bool validate_only = 2;
+}
+
+message ImportVersionResponse {
+  // Unset with `validate_only`.
+  Version version = 1;
 }

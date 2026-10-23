@@ -5,6 +5,12 @@
 //! [--artifact <file>] [--metadata <file>]` checks a signed version
 //! manifest offline, with only the trusted public keys. The envelope file is
 //! the `GetVersionManifest` response as JSON; its `metadata` is checked too.
+//!
+//! `hinagata export --server <url> --token-file <file> [--ca <pem>] --model
+//! <model> --version <n>... --out <dir>` writes a signed bundle, and
+//! `hinagata import --server <url> --token-file <file> [--ca <pem>] --keys
+//! <trusted.json> --bundle <dir>` verifies and imports one
+//! (docs/bundles.md).
 
 use hinagata::api::{Api, serve};
 use hinagata::config;
@@ -53,6 +59,9 @@ async fn run() -> Result<(), String> {
     if let Some(hook) = config::approval_hook(var)? {
         api = api.with_approval_hook(hook);
     }
+    if let Some(keys) = config::trusted_keys(var)? {
+        api = api.with_trusted_keys(keys);
+    }
     serve(api, listener, tls, async {
         let _ = tokio::signal::ctrl_c().await;
     })
@@ -60,31 +69,51 @@ async fn run() -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-/// `hinagata verify`: offline, against trusted keys only. Every flag takes
-/// a path; an unknown, repeated or valueless flag is refused, so a missing
-/// path never silently skips a check.
-fn verify(args: &[String]) -> Result<String, String> {
-    let mut flags = std::collections::BTreeMap::new();
+/// Parse `--flag value` pairs. Every flag takes a value; an unknown or
+/// valueless flag is refused, and so is a repeated one unless it is in
+/// `repeatable`, so a missing value never silently skips a step.
+fn flags<'a>(
+    args: &'a [String],
+    allowed: &[&str],
+    repeatable: &[&str],
+) -> Result<std::collections::BTreeMap<&'a str, Vec<&'a str>>, String> {
+    let mut flags = std::collections::BTreeMap::<&str, Vec<&str>>::new();
     let mut args = args.iter();
     while let Some(name) = args.next() {
-        if !["--keys", "--envelope", "--artifact", "--metadata"].contains(&name.as_str()) {
+        if !allowed.contains(&name.as_str()) {
             return Err(format!("unknown argument `{name}`"));
         }
         let value = args
             .next()
             .filter(|value| !value.is_empty() && !value.starts_with("--"))
-            .ok_or_else(|| format!("{name} needs a path"))?;
-        if flags.insert(name.as_str(), value.as_str()).is_some() {
+            .ok_or_else(|| format!("{name} needs a value"))?;
+        let values = flags.entry(name.as_str()).or_default();
+        if !values.is_empty() && !repeatable.contains(&name.as_str()) {
             return Err(format!("{name} is given twice"));
         }
+        values.push(value.as_str());
     }
+    Ok(flags)
+}
+
+/// The single value of `name`, if given.
+fn one<'a>(
+    flags: &std::collections::BTreeMap<&'a str, Vec<&'a str>>,
+    name: &str,
+) -> Option<&'a str> {
+    flags.get(name).map(|values| values[0])
+}
+
+/// `hinagata verify`: offline, against trusted keys only.
+fn verify(args: &[String]) -> Result<String, String> {
+    let flags = flags(
+        args,
+        &["--keys", "--envelope", "--artifact", "--metadata"],
+        &[],
+    )?;
     let read = |path: &str| std::fs::read(path).map_err(|error| format!("{path}: {error}"));
-    let keys = flags
-        .get("--keys")
-        .ok_or("verify needs --keys <trusted keys file>")?;
-    let envelope = flags
-        .get("--envelope")
-        .ok_or("verify needs --envelope <manifest file>")?;
+    let keys = one(&flags, "--keys").ok_or("verify needs --keys <trusted keys file>")?;
+    let envelope = one(&flags, "--envelope").ok_or("verify needs --envelope <manifest file>")?;
     let keys = hinagata::signing::TrustedKeys::from_json(
         &String::from_utf8(read(keys)?).map_err(|_| "the keys file is not UTF-8")?,
     )?;
@@ -92,7 +121,7 @@ fn verify(args: &[String]) -> Result<String, String> {
     let envelope: hinagata::signing::Envelope =
         serde_json::from_slice(&raw).map_err(|error| format!("envelope: {error}"))?;
     let manifest = keys.verify(&envelope)?;
-    let metadata = match flags.get("--metadata") {
+    let metadata = match one(&flags, "--metadata") {
         Some(path) => read(path)?,
         None => {
             #[derive(serde::Deserialize)]
@@ -105,7 +134,7 @@ fn verify(args: &[String]) -> Result<String, String> {
                 .into_bytes()
         }
     };
-    let artifact = flags.get("--artifact").map(|path| read(path)).transpose()?;
+    let artifact = one(&flags, "--artifact").map(read).transpose()?;
     hinagata::signing::check_contents(&manifest, artifact.as_deref(), Some(&metadata))?;
     Ok(format!(
         "verified {}{} version {} of `{}` in `{}`, signed by `{}`",
@@ -122,6 +151,44 @@ fn verify(args: &[String]) -> Result<String, String> {
     ))
 }
 
+/// `hinagata export` and `hinagata import`: move versions between
+/// registries as a signed bundle.
+async fn bundle(command: &str, args: &[String]) -> Result<Vec<String>, String> {
+    let read = |path: &str| std::fs::read(path).map_err(|error| format!("{path}: {error}"));
+    let common = ["--server", "--token-file", "--ca"];
+    let flags = match command {
+        "export" => flags(
+            args,
+            &[&common[..], &["--model", "--version", "--out"]].concat(),
+            &["--version"],
+        )?,
+        _ => flags(args, &[&common[..], &["--keys", "--bundle"]].concat(), &[])?,
+    };
+    let need = |name: &str| one(&flags, name).ok_or(format!("{command} needs {name}"));
+    let token = String::from_utf8(read(need("--token-file")?)?)
+        .map_err(|_| "the token file is not UTF-8")?;
+    let ca = one(&flags, "--ca").map(read).transpose()?;
+    let mut client = hinagata::bundle::Client::connect(need("--server")?, token, ca).await?;
+    if command == "export" {
+        let versions = flags
+            .get("--version")
+            .ok_or("export needs --version")?
+            .iter()
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("`{value}` is not a version"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let out = std::path::Path::new(need("--out")?);
+        return hinagata::bundle::export(&mut client, need("--model")?, &versions, out).await;
+    }
+    let keys = hinagata::signing::TrustedKeys::from_json(
+        &String::from_utf8(read(need("--keys")?)?).map_err(|_| "the keys file is not UTF-8")?,
+    )?;
+    hinagata::bundle::import(&mut client, &keys, std::path::Path::new(need("--bundle")?)).await
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -133,6 +200,20 @@ async fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("hinagata verify: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(command @ ("export" | "import")) = args.get(1).map(String::as_str) {
+        return match bundle(command, &args[2..]).await {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{command}ed {line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("hinagata {command}: {error}");
                 ExitCode::FAILURE
             }
         };

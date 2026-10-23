@@ -32,6 +32,10 @@ Models and versions live in the caller's namespace, in one embedded database fil
 
 With `HINAGATA_SIGNING_KEY_FILE` (an Ed25519 seed as 64 hex characters) and `HINAGATA_SIGNING_KEY_ID`, `GetVersionManifest` returns a version's metadata and a detached signature over its manifest: namespace, model, version number, artifact digest and metadata digest. Anyone holding the public key can check, offline, that an artifact and its metadata came from this registry: `hinagata verify --keys trusted.json --envelope manifest.json --artifact model.onnx`. The format is in [docs/signatures.md](docs/signatures.md), so other verifiers need no Hinagata code. Without a key the call is refused.
 
+## Offline transfer
+
+`hinagata export` writes signed versions and their artifacts into a bundle directory, and `hinagata import` moves it into another registry. The import verifies every signature and digest first. The target admits only versions signed by a key in its `HINAGATA_TRUSTED_KEYS_FILE`, and audits where each one came from ([bundles](docs/bundles.md)).
+
 ## Artifacts
 
 Model artifacts are content-addressed: stored once by SHA-256 on local disk (`HINAGATA_ARTIFACT_DIR`, default `artifacts`) or in an S3-compatible bucket (`HINAGATA_S3_BUCKET`, with `HINAGATA_S3_ENDPOINT` for a non-AWS store and the standard `AWS_*` credentials). `HINAGATA_MAX_ARTIFACT_BYTES` caps one artifact (default 1 GiB).
@@ -59,6 +63,7 @@ Hinagata stores no predictions or labels. The caller joins labels to its own pre
 | `POST /v1/models/{model}/versions`, `GET /v1/models/{model}/versions` | `RegisterVersion`, `ListVersions` |
 | `GET /v1/models/{model}/versions/{version}` | `GetVersion` |
 | `GET /v1/models/{model}/versions/{version}/manifest` | `GetVersionManifest` |
+| gRPC only | `ImportVersion` |
 | `GET /v1/models/{model}/signature-compatibility?from_version=…&to_version=…` | `CheckSignatureCompatibility` |
 | `GET /v1/lineage/trained-on?dataset_id=…&digest=…` | `ListVersionsTrainedOn` |
 | `POST /v1/models/{model}/versions/{version}/stage` | `SetVersionStage` |

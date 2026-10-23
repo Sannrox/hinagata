@@ -603,103 +603,34 @@ impl Registry {
         new: NewVersion,
     ) -> Result<Version> {
         check_new_version(&new)?;
+        self.write(|tx| register_in(tx, actor, model, new).map(|(version, _)| version))
+    }
+
+    /// Register a version imported from another registry, as
+    /// [`Self::register_version`], and audit where it came from as
+    /// `version.imported` in the same transaction. Importing the same
+    /// version again returns the stored one and records nothing.
+    pub fn import_version(
+        &self,
+        actor: Actor<'_>,
+        model: &str,
+        new: NewVersion,
+        provenance: &impl Serialize,
+    ) -> Result<Version> {
+        check_new_version(&new)?;
         self.write(|tx| {
-            if load_model(tx, actor.namespace, model)?.is_none() {
-                return Err(RegistryError::NotFound(format!(
-                    "model `{model}` does not exist"
-                )));
-            }
-            let existing = tx
-                .query_row(
-                    &format!("{VERSION_COLUMNS} WHERE namespace = ?1 AND model = ?2 AND artifact_digest = ?3"),
-                    params![actor.namespace, model, new.artifact_digest],
-                    version_row,
-                )
-                .optional()?
-                .transpose()?;
-            if let Some(stored) = existing {
-                return if same_content(&stored, &new) {
-                    Ok(stored)
-                } else {
-                    Err(RegistryError::Conflict(format!(
-                        "artifact {} is already version {} of `{model}` with other metadata",
-                        new.artifact_digest, stored.version
-                    )))
-                };
-            }
-            // Only a new version must name a stored artifact, so retrying a
-            // registration from before artifacts were stored still answers.
-            if artifact_size(tx, actor.namespace, &new.artifact_digest)?.is_none() {
-                return Err(RegistryError::Refused(format!(
-                    "artifact {} is not stored in this namespace; upload it first",
-                    new.artifact_digest
-                )));
-            }
-            let next: u64 = tx.query_row(
-                "SELECT COALESCE(MAX(version), 0) + 1 FROM versions WHERE namespace = ?1 AND model = ?2",
-                params![actor.namespace, model],
-                |row| row.get(0),
-            )?;
-            let version = Version {
-                model: model.into(),
-                version: next,
-                artifact_digest: new.artifact_digest,
-                framework: new.framework,
-                format: new.format,
-                signature: new.signature,
-                metrics: new.metrics,
-                tags: new.tags,
-                lineage: new.lineage,
-                binding: new.binding,
-                stage: Stage::Candidate,
-                created_at_ms: actor.now_ms,
-                created_by: actor.subject.into(),
-            };
-            tx.execute(
-                "INSERT INTO versions (namespace, model, version, artifact_digest, framework,
-                     format, signature, metrics, tags, stage, created_at_ms, created_by, lineage,
-                     binding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    actor.namespace,
-                    version.model,
+            let (version, created) = register_in(tx, actor, model, new)?;
+            if created {
+                audit(
+                    tx,
+                    actor,
+                    "version.imported",
+                    model,
                     version.version,
-                    version.artifact_digest,
-                    version.framework,
-                    version.format,
-                    json(&version.signature)?,
-                    json(&version.metrics)?,
-                    json(&version.tags)?,
-                    version.stage.as_str(),
-                    version.created_at_ms,
-                    version.created_by,
-                    json(&version.lineage)?,
-                    version.binding.as_ref().map(json).transpose()?,
-                ],
-            )?;
-            for dataset in &version.lineage.training_datasets {
-                tx.execute(
-                    "INSERT INTO training_datasets (namespace, model, version, dataset_id,
-                         dataset_version, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        actor.namespace,
-                        version.model,
-                        version.version,
-                        dataset.dataset_id,
-                        dataset.version,
-                        dataset.digest
-                    ],
+                    None::<&()>,
+                    Some(provenance),
                 )?;
             }
-            audit(
-                tx,
-                actor,
-                "version.registered",
-                model,
-                version.version,
-                None::<&Version>,
-                Some(&version),
-            )?;
             Ok(version)
         })
     }
@@ -1366,6 +1297,114 @@ pub(crate) fn load_version(
             "version {version} of `{model}` does not exist"
         )))
     })
+}
+
+/// Register `new` in `tx`; whether it is a new version.
+fn register_in(
+    tx: &rusqlite::Transaction<'_>,
+    actor: Actor<'_>,
+    model: &str,
+    new: NewVersion,
+) -> Result<(Version, bool)> {
+    if load_model(tx, actor.namespace, model)?.is_none() {
+        return Err(RegistryError::NotFound(format!(
+            "model `{model}` does not exist"
+        )));
+    }
+    let existing = tx
+        .query_row(
+            &format!(
+                "{VERSION_COLUMNS} WHERE namespace = ?1 AND model = ?2 AND artifact_digest = ?3"
+            ),
+            params![actor.namespace, model, new.artifact_digest],
+            version_row,
+        )
+        .optional()?
+        .transpose()?;
+    if let Some(stored) = existing {
+        return if same_content(&stored, &new) {
+            Ok((stored, false))
+        } else {
+            Err(RegistryError::Conflict(format!(
+                "artifact {} is already version {} of `{model}` with other metadata",
+                new.artifact_digest, stored.version
+            )))
+        };
+    }
+    // Only a new version must name a stored artifact, so retrying a
+    // registration from before artifacts were stored still answers.
+    if artifact_size(tx, actor.namespace, &new.artifact_digest)?.is_none() {
+        return Err(RegistryError::Refused(format!(
+            "artifact {} is not stored in this namespace; upload it first",
+            new.artifact_digest
+        )));
+    }
+    let next: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM versions WHERE namespace = ?1 AND model = ?2",
+        params![actor.namespace, model],
+        |row| row.get(0),
+    )?;
+    let version = Version {
+        model: model.into(),
+        version: next,
+        artifact_digest: new.artifact_digest,
+        framework: new.framework,
+        format: new.format,
+        signature: new.signature,
+        metrics: new.metrics,
+        tags: new.tags,
+        lineage: new.lineage,
+        binding: new.binding,
+        stage: Stage::Candidate,
+        created_at_ms: actor.now_ms,
+        created_by: actor.subject.into(),
+    };
+    tx.execute(
+        "INSERT INTO versions (namespace, model, version, artifact_digest, framework,
+                 format, signature, metrics, tags, stage, created_at_ms, created_by, lineage,
+                 binding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            actor.namespace,
+            version.model,
+            version.version,
+            version.artifact_digest,
+            version.framework,
+            version.format,
+            json(&version.signature)?,
+            json(&version.metrics)?,
+            json(&version.tags)?,
+            version.stage.as_str(),
+            version.created_at_ms,
+            version.created_by,
+            json(&version.lineage)?,
+            version.binding.as_ref().map(json).transpose()?,
+        ],
+    )?;
+    for dataset in &version.lineage.training_datasets {
+        tx.execute(
+            "INSERT INTO training_datasets (namespace, model, version, dataset_id,
+                     dataset_version, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                actor.namespace,
+                version.model,
+                version.version,
+                dataset.dataset_id,
+                dataset.version,
+                dataset.digest
+            ],
+        )?;
+    }
+    audit(
+        tx,
+        actor,
+        "version.registered",
+        model,
+        version.version,
+        None::<&Version>,
+        Some(&version),
+    )?;
+    Ok((version, true))
 }
 
 fn same_content(stored: &Version, new: &NewVersion) -> bool {
