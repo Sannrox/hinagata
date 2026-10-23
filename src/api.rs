@@ -3,11 +3,12 @@
 //! namespace through the [`Authenticator`]; requests carry none.
 
 use crate::auth::{AuthError, Authenticator, Identity, bearer};
+use crate::registry::{self, Actor, Registry, RegistryError, Stage};
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use std::sync::Arc;
 
 pub mod proto {
@@ -33,6 +34,29 @@ impl From<AuthError> for ApiError {
     }
 }
 
+impl From<RegistryError> for ApiError {
+    fn from(error: RegistryError) -> Self {
+        let code = match &error {
+            RegistryError::Invalid(_) => tonic::Code::InvalidArgument,
+            RegistryError::NotFound(_) => tonic::Code::NotFound,
+            RegistryError::Conflict(_) => tonic::Code::AlreadyExists,
+            RegistryError::Refused(_) => tonic::Code::FailedPrecondition,
+            RegistryError::Storage(detail) => {
+                // The detail can name the database file; keep it in the log.
+                eprintln!("hinagata: registry storage: {detail}");
+                return Self {
+                    code: tonic::Code::Internal,
+                    message: "the registry could not complete the request".into(),
+                };
+            }
+        };
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
 impl From<ApiError> for tonic::Status {
     fn from(error: ApiError) -> Self {
         tonic::Status::new(error.code, error.message)
@@ -45,21 +69,81 @@ impl IntoResponse for ApiError {
             tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
             tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
             tonic::Code::NotFound => StatusCode::NOT_FOUND,
+            tonic::Code::AlreadyExists | tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
+            tonic::Code::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
         (status, Json(serde_json::json!({"error": self.message}))).into_response()
     }
 }
 
-/// The API over one authentication hook.
+/// The API over one authentication hook and one registry.
 #[derive(Clone)]
 pub struct Api {
     auth: Arc<dyn Authenticator>,
+    registry: Arc<Registry>,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+fn model_out(model: registry::Model) -> proto::Model {
+    proto::Model {
+        name: model.name,
+        description: model.description,
+        created_at_ms: model.created_at_ms,
+        created_by: model.created_by,
+    }
+}
+
+fn spec_in(spec: proto::TensorSpec) -> registry::TensorSpec {
+    registry::TensorSpec {
+        name: spec.name,
+        dtype: spec.dtype,
+        shape: spec.shape,
+        nullable: spec.nullable,
+    }
+}
+
+fn spec_out(spec: registry::TensorSpec) -> proto::TensorSpec {
+    proto::TensorSpec {
+        name: spec.name,
+        dtype: spec.dtype,
+        shape: spec.shape,
+        nullable: spec.nullable,
+    }
+}
+
+fn version_out(version: registry::Version) -> proto::Version {
+    proto::Version {
+        model: version.model,
+        version: version.version,
+        artifact_digest: version.artifact_digest,
+        framework: version.framework,
+        format: version.format,
+        signature: Some(proto::Signature {
+            inputs: version.signature.inputs.into_iter().map(spec_out).collect(),
+            outputs: version
+                .signature
+                .outputs
+                .into_iter()
+                .map(spec_out)
+                .collect(),
+        }),
+        metrics: version.metrics.into_iter().collect(),
+        tags: version.tags.into_iter().collect(),
+        stage: version.stage.as_str().into(),
+        created_at_ms: version.created_at_ms,
+        created_by: version.created_by,
+    }
 }
 
 impl Api {
-    pub fn new(auth: Arc<dyn Authenticator>) -> Self {
-        Self { auth }
+    pub fn new(auth: Arc<dyn Authenticator>, registry: Arc<Registry>) -> Self {
+        Self { auth, registry }
     }
 
     /// The caller's identity from its `authorization` value.
@@ -78,6 +162,158 @@ impl Api {
             subject: identity.subject().to_string(),
         })
     }
+
+    pub fn create_model(
+        &self,
+        authorization: Option<&str>,
+        request: proto::CreateModelRequest,
+    ) -> Result<proto::Model, ApiError> {
+        let identity = self.identity(authorization)?;
+        let model =
+            self.registry
+                .create_model(actor(&identity), &request.name, &request.description)?;
+        Ok(model_out(model))
+    }
+
+    pub fn get_model(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetModelRequest,
+    ) -> Result<proto::Model, ApiError> {
+        let identity = self.identity(authorization)?;
+        Ok(model_out(
+            self.registry
+                .get_model(identity.namespace(), &request.name)?,
+        ))
+    }
+
+    pub fn list_models(
+        &self,
+        authorization: Option<&str>,
+        request: proto::ListModelsRequest,
+    ) -> Result<proto::ListModelsResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let models =
+            self.registry
+                .list_models(identity.namespace(), &request.after, request.limit)?;
+        Ok(proto::ListModelsResponse {
+            models: models.into_iter().map(model_out).collect(),
+        })
+    }
+
+    pub fn register_version(
+        &self,
+        authorization: Option<&str>,
+        request: proto::RegisterVersionRequest,
+    ) -> Result<proto::Version, ApiError> {
+        let identity = self.identity(authorization)?;
+        let signature = request.signature.unwrap_or_default();
+        let new = registry::NewVersion {
+            artifact_digest: request.artifact_digest,
+            framework: request.framework,
+            format: request.format,
+            signature: registry::Signature {
+                inputs: signature.inputs.into_iter().map(spec_in).collect(),
+                outputs: signature.outputs.into_iter().map(spec_in).collect(),
+            },
+            metrics: request.metrics.into_iter().collect(),
+            tags: request.tags.into_iter().collect(),
+        };
+        let version = self
+            .registry
+            .register_version(actor(&identity), &request.model, new)?;
+        Ok(version_out(version))
+    }
+
+    pub fn get_version(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetVersionRequest,
+    ) -> Result<proto::Version, ApiError> {
+        let identity = self.identity(authorization)?;
+        let version =
+            self.registry
+                .get_version(identity.namespace(), &request.model, request.version)?;
+        Ok(version_out(version))
+    }
+
+    pub fn list_versions(
+        &self,
+        authorization: Option<&str>,
+        request: proto::ListVersionsRequest,
+    ) -> Result<proto::ListVersionsResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let versions = self.registry.list_versions(
+            identity.namespace(),
+            &request.model,
+            request.after,
+            request.limit,
+        )?;
+        Ok(proto::ListVersionsResponse {
+            versions: versions.into_iter().map(version_out).collect(),
+        })
+    }
+
+    pub fn set_version_stage(
+        &self,
+        authorization: Option<&str>,
+        request: proto::SetVersionStageRequest,
+    ) -> Result<proto::Version, ApiError> {
+        let identity = self.identity(authorization)?;
+        let stage = Stage::parse(&request.stage)?;
+        let expected = match request.expected_stage.as_str() {
+            "" => None,
+            value => Some(Stage::parse(value)?),
+        };
+        let version = self.registry.set_stage(
+            actor(&identity),
+            &request.model,
+            request.version,
+            stage,
+            expected,
+        )?;
+        Ok(version_out(version))
+    }
+
+    pub fn list_audit_events(
+        &self,
+        authorization: Option<&str>,
+        request: proto::ListAuditEventsRequest,
+    ) -> Result<proto::ListAuditEventsResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let model = (!request.model.is_empty()).then_some(request.model.as_str());
+        let events = self.registry.list_audit_events(
+            identity.namespace(),
+            model,
+            request.after_seq,
+            request.limit,
+        )?;
+        Ok(proto::ListAuditEventsResponse {
+            events: events
+                .into_iter()
+                .map(|event| proto::AuditEvent {
+                    seq: event.seq,
+                    at_ms: event.at_ms,
+                    actor: event.actor,
+                    action: event.action,
+                    model: event.model,
+                    version: event.version,
+                    before: event.before.unwrap_or_default(),
+                    after: event.after.unwrap_or_default(),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// The acting identity: its namespace scopes the write, its subject is
+/// recorded as the actor.
+fn actor(identity: &Identity) -> Actor<'_> {
+    Actor {
+        namespace: identity.namespace(),
+        subject: identity.subject(),
+        now_ms: now_ms(),
+    }
 }
 
 fn metadata_auth<T>(request: &tonic::Request<T>) -> Option<String> {
@@ -88,19 +324,51 @@ fn metadata_auth<T>(request: &tonic::Request<T>) -> Option<String> {
         .map(str::to_string)
 }
 
-#[tonic::async_trait]
-impl Hinagata for Api {
-    async fn get_identity(
-        &self,
-        request: tonic::Request<proto::GetIdentityRequest>,
-    ) -> Result<tonic::Response<proto::GetIdentityResponse>, tonic::Status> {
-        let auth = metadata_auth(&request);
-        Ok(tonic::Response::new(Api::get_identity(
-            self,
-            auth.as_deref(),
-            request.into_inner(),
-        )?))
-    }
+/// Run an API call on the blocking pool: registry calls wait on SQLite and
+/// its lock, which must not hold up the async workers.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(call).await.unwrap_or_else(|_| {
+        Err(ApiError {
+            code: tonic::Code::Internal,
+            message: "the request did not complete".into(),
+        })
+    })
+}
+
+/// Each gRPC method calls the [`Api`] method of the same name with the
+/// request's `authorization` metadata, on the blocking pool.
+macro_rules! grpc_methods {
+    ($($method:ident($request:ident) -> $response:ident;)*) => {
+        #[tonic::async_trait]
+        impl Hinagata for Api {
+            $(
+                async fn $method(
+                    &self,
+                    request: tonic::Request<proto::$request>,
+                ) -> Result<tonic::Response<proto::$response>, tonic::Status> {
+                    let auth = metadata_auth(&request);
+                    let (api, request) = (self.clone(), request.into_inner());
+                    let response =
+                        blocking(move || Api::$method(&api, auth.as_deref(), request)).await?;
+                    Ok(tonic::Response::new(response))
+                }
+            )*
+        }
+    };
+}
+
+grpc_methods! {
+    get_identity(GetIdentityRequest) -> GetIdentityResponse;
+    create_model(CreateModelRequest) -> Model;
+    get_model(GetModelRequest) -> Model;
+    list_models(ListModelsRequest) -> ListModelsResponse;
+    register_version(RegisterVersionRequest) -> Version;
+    get_version(GetVersionRequest) -> Version;
+    list_versions(ListVersionsRequest) -> ListVersionsResponse;
+    set_version_stage(SetVersionStageRequest) -> Version;
+    list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
 }
 
 fn header_auth(headers: &HeaderMap) -> Option<&str> {
@@ -109,15 +377,119 @@ fn header_auth(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
-/// The HTTP/JSON routes.
+/// One HTTP call: the [`Api`] method with the `authorization` header, on
+/// the blocking pool, answered as JSON.
+async fn call<Req: Send + 'static, Res: Send + 'static>(
+    api: Api,
+    headers: &HeaderMap,
+    request: Req,
+    method: fn(&Api, Option<&str>, Req) -> Result<Res, ApiError>,
+) -> Result<Json<Res>, ApiError> {
+    let auth = header_auth(headers).map(str::to_string);
+    blocking(move || method(&api, auth.as_deref(), request))
+        .await
+        .map(Json)
+}
+
+/// The HTTP/JSON routes. Bodies and query strings are the request messages
+/// in JSON; path segments fill the model and version.
 pub fn http_router(api: Api) -> axum::Router {
     axum::Router::new()
         .route(
             "/v1/identity",
             get(|State(api): State<Api>, headers: HeaderMap| async move {
-                api.get_identity(header_auth(&headers), proto::GetIdentityRequest {})
-                    .map(Json)
+                call(
+                    api,
+                    &headers,
+                    proto::GetIdentityRequest {},
+                    Api::get_identity,
+                )
+                .await
             }),
+        )
+        .route(
+            "/v1/models",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Json(request): Json<proto::CreateModelRequest>| async move {
+                    call(api, &headers, request, Api::create_model).await
+                },
+            )
+            .get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Query(request): Query<proto::ListModelsRequest>| async move {
+                    call(api, &headers, request, Api::list_models).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}",
+            get(
+                |State(api): State<Api>, headers: HeaderMap, Path(name): Path<String>| async move {
+                    let request = proto::GetModelRequest { name };
+                    call(api, &headers, request, Api::get_model).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path(model): Path<String>,
+                 Json(request): Json<proto::RegisterVersionRequest>| async move {
+                    let request = proto::RegisterVersionRequest { model, ..request };
+                    call(api, &headers, request, Api::register_version).await
+                },
+            )
+            .get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path(model): Path<String>,
+                 Query(request): Query<proto::ListVersionsRequest>| async move {
+                    let request = proto::ListVersionsRequest { model, ..request };
+                    call(api, &headers, request, Api::list_versions).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>| async move {
+                    let request = proto::GetVersionRequest { model, version };
+                    call(api, &headers, request, Api::get_version).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/stage",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Json(request): Json<proto::SetVersionStageRequest>| async move {
+                    let request = proto::SetVersionStageRequest {
+                        model,
+                        version,
+                        ..request
+                    };
+                    call(api, &headers, request, Api::set_version_stage).await
+                },
+            ),
+        )
+        .route(
+            "/v1/audit-events",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Query(request): Query<proto::ListAuditEventsRequest>| async move {
+                    call(api, &headers, request, Api::list_audit_events).await
+                },
+            ),
         )
         .with_state(api)
 }
