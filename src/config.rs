@@ -17,6 +17,8 @@
 //!   `HINAGATA_S3_ENDPOINT` for a non-AWS store and the standard `AWS_*`
 //!   credentials. `HINAGATA_MAX_ARTIFACT_BYTES` caps one artifact (default
 //!   1 GiB).
+//! - `HINAGATA_SIGNING_KEY_FILE` (the 32-byte Ed25519 seed as 64 hex
+//!   characters) with `HINAGATA_SIGNING_KEY_ID` signs version manifests.
 //! - `HINAGATA_TLS_CERT` and `HINAGATA_TLS_KEY` (PEM) serve over TLS; adding
 //!   `HINAGATA_TLS_CLIENT_CA` requires client certificates (mTLS).
 
@@ -80,6 +82,23 @@ pub fn authenticator(
         )?));
     }
     Err("no authentication configured: set HINAGATA_STATIC_TOKEN_FILE or HINAGATA_JWKS_FILE".into())
+}
+
+/// The manifest signer, if a signing key is configured. A key file without
+/// a key id, or the reverse, is refused.
+pub fn signer(
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Option<crate::signing::Signer>, String> {
+    match (
+        read(&var, "HINAGATA_SIGNING_KEY_FILE")?,
+        var("HINAGATA_SIGNING_KEY_ID"),
+    ) {
+        (Some(seed), Some(key_id)) => {
+            crate::signing::Signer::from_seed_hex(key_id, &seed).map(Some)
+        }
+        (None, None) => Ok(None),
+        _ => Err("signing needs both HINAGATA_SIGNING_KEY_FILE and HINAGATA_SIGNING_KEY_ID".into()),
+    }
 }
 
 /// The TLS configuration, if any. Any TLS setting without a full server
