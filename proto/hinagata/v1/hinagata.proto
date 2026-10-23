@@ -21,6 +21,9 @@ service Hinagata {
   rpc RegisterVersion(RegisterVersionRequest) returns (Version);
   rpc GetVersion(GetVersionRequest) returns (Version);
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+  // Versions trained on a dataset, optionally at one digest: the reverse of
+  // a version's lineage.
+  rpc ListVersionsTrainedOn(ListVersionsTrainedOnRequest) returns (ListVersionsResponse);
 
   // Move a version between stages: candidate and staging either way, and
   // either of them to archived, which is final. Production needs an
@@ -100,6 +103,34 @@ message Version {
   string stage = 9;
   int64 created_at_ms = 10;
   string created_by = 11;
+  // What produced the version. Fixed at registration like the rest.
+  Lineage lineage = 12;
+}
+
+message DatasetVersion {
+  string dataset_id = 1;
+  // The dataset's version id; empty when the source names none.
+  string version = 2;
+  // `sha256:<64 lowercase hex>` of the data the training run read.
+  string digest = 3;
+}
+
+message CodeReference {
+  string repository = 1;
+  // 7 to 64 hex characters.
+  string commit = 2;
+  // `sha256:<hex>` of the training code, as the run receipt records it.
+  string digest = 3;
+}
+
+message Lineage {
+  repeated DatasetVersion training_datasets = 1;
+  CodeReference code = 2;
+  map<string, string> parameters = 3;
+  // The training run's id in the batch runner.
+  string run_receipt_id = 4;
+  // SHA-256 of the run receipt, when the version was registered from one.
+  string run_receipt_digest = 5;
 }
 
 message RegisterVersionRequest {
@@ -110,6 +141,13 @@ message RegisterVersionRequest {
   Signature signature = 5;
   map<string, double> metrics = 6;
   map<string, string> tags = 7;
+  Lineage lineage = 8;
+  // A batch runner training receipt (JSON, receipt schema 6). When set, its
+  // inputs become the training datasets, its job id the run receipt id and
+  // its code digest the code digest; `lineage` may add the repository,
+  // commit and parameters but not datasets. The receipt must list
+  // `artifact_digest` among its outputs.
+  string training_run_receipt_json = 9;
 }
 
 message GetVersionRequest {
@@ -126,6 +164,16 @@ message ListVersionsRequest {
 
 message ListVersionsResponse {
   repeated Version versions = 1;
+}
+
+message ListVersionsTrainedOnRequest {
+  string dataset_id = 1;
+  // Only this dataset digest, when set.
+  string digest = 2;
+  // Versions after (after_model, after_version), in that order.
+  string after_model = 3;
+  uint64 after_version = 4;
+  uint32 limit = 5;
 }
 
 message SetVersionStageRequest {

@@ -23,6 +23,7 @@ One listener serves gRPC (`hinagata.v1.Hinagata`, see `proto/hinagata/v1/`) and 
 Models and versions live in the caller's namespace, in one embedded database file (`HINAGATA_DB_PATH`, default `hinagata.db`; [ADR 0001](docs/decisions/0001-embedded-registry-store.md)).
 
 - A version records the artifact digest (`sha256:<hex>`), framework, format (`onnx`), signature, metrics and tags. It is numbered 1, 2, … per model and never changes once registered. Registering the same artifact again with the same content returns the stored version; with other content it is refused.
+- Lineage: each version records its training dataset versions (id, version, digest), code reference (repository, commit, code digest), parameters and the training run's receipt id, all fixed at registration. Registering with `training_run_receipt_json` (a batch runner receipt, schema 6) takes the datasets, run id and code digest from the receipt, records the receipt's digest, and refuses an artifact the run did not produce. `ListVersionsTrainedOn` answers the reverse question: which versions were trained on a dataset, optionally at one digest.
 - Stages: a version starts as `candidate`. It moves between `candidate` and `staging`, and from either to `archived`, which is final. Promotion to `production` needs the approval hook and is refused until one is configured. `expected_stage` makes a change apply only if the version has not moved since it was read.
 - Every change is an audit event with its actor (the credential's subject), action, and the record before and after.
 
@@ -33,6 +34,7 @@ Models and versions live in the caller's namespace, in one embedded database fil
 | `GET /v1/models/{model}` | `GetModel` |
 | `POST /v1/models/{model}/versions`, `GET /v1/models/{model}/versions` | `RegisterVersion`, `ListVersions` |
 | `GET /v1/models/{model}/versions/{version}` | `GetVersion` |
+| `GET /v1/lineage/trained-on?dataset_id=…&digest=…` | `ListVersionsTrainedOn` |
 | `POST /v1/models/{model}/versions/{version}/stage` | `SetVersionStage` |
 | `GET /v1/audit-events` | `ListAuditEvents` |
 

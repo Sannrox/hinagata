@@ -19,7 +19,8 @@ use std::time::Duration;
 
 /// Schema migrations, applied in order and recorded in `user_version`.
 /// Append only: an older database must always open with a newer binary.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE models (
     namespace TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -79,7 +80,34 @@ CREATE TRIGGER audit_events_are_never_deleted BEFORE DELETE ON audit_events
 BEGIN
     SELECT RAISE(ABORT, 'audit events are never deleted');
 END;
-"#];
+"#,
+    r#"
+ALTER TABLE versions ADD COLUMN lineage TEXT NOT NULL DEFAULT '{}';
+CREATE TRIGGER versions_lineage_is_immutable BEFORE UPDATE OF lineage ON versions
+BEGIN
+    SELECT RAISE(ABORT, 'a registered version is immutable');
+END;
+CREATE TABLE training_datasets (
+    namespace TEXT NOT NULL,
+    model TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    dataset_id TEXT NOT NULL,
+    dataset_version TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    PRIMARY KEY (namespace, model, version, dataset_id, digest),
+    FOREIGN KEY (namespace, model, version) REFERENCES versions (namespace, model, version)
+);
+CREATE INDEX training_datasets_by_dataset ON training_datasets (namespace, dataset_id, digest);
+CREATE TRIGGER training_datasets_are_immutable BEFORE UPDATE ON training_datasets
+BEGIN
+    SELECT RAISE(ABORT, 'a registered version is immutable');
+END;
+CREATE TRIGGER training_datasets_are_never_deleted BEFORE DELETE ON training_datasets
+BEGIN
+    SELECT RAISE(ABORT, 'a registered version is never deleted');
+END;
+"#,
+];
 
 /// Most items one list call returns.
 pub const MAX_PAGE: u32 = 1000;
@@ -192,6 +220,98 @@ pub struct Signature {
     pub outputs: Vec<TensorSpec>,
 }
 
+/// One dataset version a model was trained on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct DatasetVersion {
+    pub dataset_id: String,
+    /// The dataset's version id; empty when the source names none.
+    pub version: String,
+    /// `sha256:<64 lowercase hex>` of the data the run read.
+    pub digest: String,
+}
+
+/// The code that trained a model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CodeReference {
+    pub repository: String,
+    pub commit: String,
+    /// Digest of the training code as the run receipt records it.
+    pub digest: String,
+}
+
+/// What produced a version: the training data, code, parameters and run.
+/// Versions registered before lineage existed read back as the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Lineage {
+    pub training_datasets: Vec<DatasetVersion>,
+    pub code: CodeReference,
+    pub parameters: BTreeMap<String, String>,
+    /// The training run's id in the batch runner.
+    pub run_receipt_id: String,
+    /// SHA-256 of the run receipt as registered, when one was given.
+    pub run_receipt_digest: String,
+}
+
+/// The batch runner receipt schema [`Lineage::from_run_receipt`] reads.
+pub const RUN_RECEIPT_VERSION: u64 = 6;
+
+impl Lineage {
+    /// Lineage from a batch runner training receipt (schema
+    /// [`RUN_RECEIPT_VERSION`]): its inputs are the training datasets, its
+    /// job id the run, and its code digest the code. The receipt must list
+    /// `artifact_digest` among its outputs: only a model the run produced
+    /// can claim it.
+    pub fn from_run_receipt(receipt: &str, artifact_digest: &str) -> Result<Self> {
+        #[derive(serde::Deserialize)]
+        struct Receipt {
+            receipt_version: u64,
+            job_id: String,
+            inputs: BTreeMap<String, String>,
+            code: String,
+            outputs: BTreeMap<String, String>,
+        }
+        let invalid = RegistryError::Invalid;
+        let parsed: Receipt = serde_json::from_str(receipt)
+            .map_err(|error| invalid(format!("training run receipt: {error}")))?;
+        if parsed.receipt_version != RUN_RECEIPT_VERSION {
+            return Err(invalid(format!(
+                "training run receipt has schema {}, expected {RUN_RECEIPT_VERSION}",
+                parsed.receipt_version
+            )));
+        }
+        if !parsed
+            .outputs
+            .values()
+            .any(|digest| digest == artifact_digest)
+        {
+            return Err(invalid(format!(
+                "the training run did not produce artifact {artifact_digest}"
+            )));
+        }
+        use sha2::Digest as _;
+        Ok(Self {
+            training_datasets: parsed
+                .inputs
+                .into_iter()
+                .map(|(dataset_id, digest)| DatasetVersion {
+                    dataset_id,
+                    version: String::new(),
+                    digest,
+                })
+                .collect(),
+            code: CodeReference {
+                digest: parsed.code,
+                ..CodeReference::default()
+            },
+            parameters: BTreeMap::new(),
+            run_receipt_id: parsed.job_id,
+            run_receipt_digest: format!("sha256:{:x}", sha2::Sha256::digest(receipt.as_bytes())),
+        })
+    }
+}
+
 /// What a caller registers. Everything here is fixed once registered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewVersion {
@@ -201,6 +321,7 @@ pub struct NewVersion {
     pub signature: Signature,
     pub metrics: BTreeMap<String, f64>,
     pub tags: BTreeMap<String, String>,
+    pub lineage: Lineage,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -213,6 +334,7 @@ pub struct Version {
     pub signature: Signature,
     pub metrics: BTreeMap<String, f64>,
     pub tags: BTreeMap<String, String>,
+    pub lineage: Lineage,
     pub stage: Stage,
     pub created_at_ms: i64,
     pub created_by: String,
@@ -404,14 +526,15 @@ impl Registry {
                 signature: new.signature,
                 metrics: new.metrics,
                 tags: new.tags,
+                lineage: new.lineage,
                 stage: Stage::Candidate,
                 created_at_ms: actor.now_ms,
                 created_by: actor.subject.into(),
             };
             tx.execute(
                 "INSERT INTO versions (namespace, model, version, artifact_digest, framework,
-                     format, signature, metrics, tags, stage, created_at_ms, created_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     format, signature, metrics, tags, stage, created_at_ms, created_by, lineage)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     actor.namespace,
                     version.model,
@@ -425,8 +548,23 @@ impl Registry {
                     version.stage.as_str(),
                     version.created_at_ms,
                     version.created_by,
+                    json(&version.lineage)?,
                 ],
             )?;
+            for dataset in &version.lineage.training_datasets {
+                tx.execute(
+                    "INSERT INTO training_datasets (namespace, model, version, dataset_id,
+                         dataset_version, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        actor.namespace,
+                        version.model,
+                        version.version,
+                        dataset.dataset_id,
+                        dataset.version,
+                        dataset.digest
+                    ],
+                )?;
+            }
             audit(
                 tx,
                 actor,
@@ -466,6 +604,35 @@ impl Registry {
             ))?;
             statement
                 .query_map(params![namespace, model, after, page(limit)], version_row)?
+                .map(|row| row?)
+                .collect()
+        })
+    }
+
+    /// Versions in the namespace trained on `dataset_id`, at `digest` when it
+    /// is set, in (model, version) order after `after`.
+    pub fn list_versions_trained_on(
+        &self,
+        namespace: &str,
+        dataset_id: &str,
+        digest: Option<&str>,
+        after: (&str, u64),
+        limit: u32,
+    ) -> Result<Vec<Version>> {
+        check_number("after_version", after.1)?;
+        self.read(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "{VERSION_COLUMNS} WHERE namespace = ?1 AND (model, version) > (?4, ?5)
+                   AND (model, version) IN (
+                     SELECT model, version FROM training_datasets
+                     WHERE namespace = ?1 AND dataset_id = ?2 AND (?3 IS NULL OR digest = ?3))
+                 ORDER BY model, version LIMIT ?6"
+            ))?;
+            statement
+                .query_map(
+                    params![namespace, dataset_id, digest, after.0, after.1, page(limit)],
+                    version_row,
+                )?
                 .map(|row| row?)
                 .collect()
         })
@@ -634,7 +801,7 @@ fn load_model(conn: &Connection, namespace: &str, name: &str) -> Result<Option<M
 
 const VERSION_COLUMNS: &str =
     "SELECT model, version, artifact_digest, framework, format, signature,
-    metrics, tags, stage, created_at_ms, created_by FROM versions";
+    metrics, tags, stage, created_at_ms, created_by, lineage FROM versions";
 
 /// A version row. The outer result is the SQLite read; the inner one parses
 /// the stored JSON and stage.
@@ -643,6 +810,7 @@ fn version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Version>> {
     let metrics: String = row.get(6)?;
     let tags: String = row.get(7)?;
     let stage: String = row.get(8)?;
+    let lineage: String = row.get(11)?;
     let (model, version, artifact_digest, framework, format, created_at_ms, created_by) = (
         row.get(0)?,
         row.get(1)?,
@@ -662,6 +830,7 @@ fn version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Version>> {
             signature: parse(&signature)?,
             metrics: parse(&metrics)?,
             tags: parse(&tags)?,
+            lineage: parse(&lineage)?,
             stage: Stage::parse(&stage)?,
             created_at_ms,
             created_by,
@@ -690,6 +859,7 @@ fn same_content(stored: &Version, new: &NewVersion) -> bool {
         && stored.signature == new.signature
         && stored.metrics == new.metrics
         && stored.tags == new.tags
+        && stored.lineage == new.lineage
 }
 
 /// Names: 1 to 128 of `A-Z a-z 0-9 . _ -`, starting with a letter or digit.
@@ -786,6 +956,78 @@ fn check_new_version(new: &NewVersion) -> Result<()> {
         check_name("tag", key)?;
         check_text("tag value", value, 1024)?;
     }
+    check_lineage(&new.lineage)
+}
+
+fn is_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+    })
+}
+
+/// A reference: 1 to `max` visible characters without whitespace.
+fn check_reference(what: &str, value: &str, max: usize) -> Result<()> {
+    if value.is_empty() || value.len() > max || !value.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(RegistryError::Invalid(format!(
+            "{what} must be 1 to {max} visible characters without whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn check_lineage(lineage: &Lineage) -> Result<()> {
+    if lineage.training_datasets.len() > 256 || lineage.parameters.len() > 256 {
+        return Err(RegistryError::Invalid(
+            "lineage has at most 256 training datasets and 256 parameters".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for dataset in &lineage.training_datasets {
+        check_reference("dataset_id", &dataset.dataset_id, 256)?;
+        if !dataset.version.is_empty() {
+            check_reference("dataset version", &dataset.version, 256)?;
+        }
+        if !is_digest(&dataset.digest) {
+            return Err(RegistryError::Invalid(format!(
+                "dataset `{}` needs a digest of sha256:<64 lowercase hex>",
+                dataset.dataset_id
+            )));
+        }
+        if !seen.insert((&dataset.dataset_id, &dataset.digest)) {
+            return Err(RegistryError::Invalid(format!(
+                "dataset `{}` is listed twice at one digest",
+                dataset.dataset_id
+            )));
+        }
+    }
+    let code = &lineage.code;
+    if !code.repository.is_empty() {
+        check_reference("code repository", &code.repository, 512)?;
+    }
+    let commit_ok =
+        (7..=64).contains(&code.commit.len()) && code.commit.chars().all(|c| c.is_ascii_hexdigit());
+    if !code.commit.is_empty() && !commit_ok {
+        return Err(RegistryError::Invalid(
+            "code commit must be 7 to 64 hex characters".into(),
+        ));
+    }
+    if !code.digest.is_empty() && !is_digest(&code.digest) {
+        return Err(RegistryError::Invalid(
+            "code digest must be sha256:<64 lowercase hex>".into(),
+        ));
+    }
+    for (key, value) in &lineage.parameters {
+        check_name("parameter", key)?;
+        check_text("parameter value", value, 1024)?;
+    }
+    if !lineage.run_receipt_id.is_empty() {
+        check_reference("run_receipt_id", &lineage.run_receipt_id, 256)?;
+    }
+    if !lineage.run_receipt_digest.is_empty() && !is_digest(&lineage.run_receipt_digest) {
+        return Err(RegistryError::Invalid(
+            "run_receipt_digest must be sha256:<64 lowercase hex>".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -831,6 +1073,7 @@ mod tests {
             },
             metrics: BTreeMap::from([("auc".into(), 0.91)]),
             tags: BTreeMap::from([("team".into(), "risk".into())]),
+            lineage: Lineage::default(),
         }
     }
 
@@ -1056,6 +1299,117 @@ mod tests {
         ));
     }
 
+    fn trained_version(digest_hex: char) -> NewVersion {
+        NewVersion {
+            lineage: Lineage {
+                training_datasets: vec![DatasetVersion {
+                    dataset_id: "orders".into(),
+                    version: "v7".into(),
+                    digest: digest('2'),
+                }],
+                code: CodeReference {
+                    repository: "github.com/example/churn".into(),
+                    commit: "9fceb02".into(),
+                    digest: String::new(),
+                },
+                parameters: BTreeMap::from([("depth".into(), "6".into())]),
+                run_receipt_id: "train-1".into(),
+                run_receipt_digest: String::new(),
+            },
+            ..new_version(&digest(digest_hex))
+        }
+    }
+
+    #[test]
+    fn lineage_is_fixed_validated_and_queryable_both_ways() {
+        let registry = registry_with_version();
+        let trained = registry
+            .register_version(actor("a"), "churn", trained_version('e'))
+            .unwrap();
+        assert_eq!(trained.lineage.training_datasets[0].version, "v7");
+        let found = registry
+            .list_versions_trained_on("a", "orders", Some(&digest('2')), ("", 0), 0)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].lineage, trained.lineage);
+        assert!(
+            registry
+                .list_versions_trained_on("a", "orders", None, ("churn", 2), 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .list_versions_trained_on("b", "orders", None, ("", 0), 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut other = trained_version('e');
+        other.lineage.parameters.insert("depth".into(), "8".into());
+        assert!(matches!(
+            registry.register_version(actor("a"), "churn", other),
+            Err(RegistryError::Conflict(_))
+        ));
+        let conn = registry.conn.lock().unwrap();
+        for statement in [
+            "UPDATE versions SET lineage = '{}'",
+            "UPDATE training_datasets SET digest = 'x'",
+            "DELETE FROM training_datasets",
+        ] {
+            assert!(conn.execute(statement, []).is_err(), "{statement}");
+        }
+        drop(conn);
+
+        let cases: [(&str, Change); 3] = [
+            ("dataset digest", |v| {
+                v.lineage.training_datasets[0].digest = "md5:1".into()
+            }),
+            ("duplicate dataset", |v| {
+                let again = v.lineage.training_datasets[0].clone();
+                v.lineage.training_datasets.push(again);
+            }),
+            ("commit", |v| v.lineage.code.commit = "main".into()),
+        ];
+        for (what, change) in cases {
+            let mut new = trained_version('f');
+            change(&mut new);
+            assert!(
+                matches!(
+                    registry.register_version(actor("a"), "churn", new),
+                    Err(RegistryError::Invalid(_))
+                ),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_receipt_must_have_the_known_schema_and_produce_the_artifact() {
+        let receipt = |version: u64| {
+            serde_json::json!({
+                "receipt_version": version,
+                "job_id": "train-1",
+                "inputs": {"orders": digest('2')},
+                "code": digest('3'),
+                "outputs": {"model.onnx": digest('4')},
+            })
+            .to_string()
+        };
+        let lineage = Lineage::from_run_receipt(&receipt(6), &digest('4')).unwrap();
+        assert_eq!(lineage.run_receipt_id, "train-1");
+        assert_eq!(lineage.code.digest, digest('3'));
+        assert!(matches!(
+            Lineage::from_run_receipt(&receipt(5), &digest('4')),
+            Err(RegistryError::Invalid(message)) if message.contains("schema 5")
+        ));
+        assert!(matches!(
+            Lineage::from_run_receipt(&receipt(6), &digest('5')),
+            Err(RegistryError::Invalid(_))
+        ));
+        assert!(Lineage::from_run_receipt("{", &digest('4')).is_err());
+    }
+
     #[test]
     fn a_database_from_an_older_schema_opens_and_a_newer_one_is_refused() {
         let path = std::env::temp_dir().join(format!(
@@ -1064,10 +1418,22 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&path);
-        // An empty file is schema 0, the oldest there is.
-        Connection::open(&path).unwrap();
+        // A database written at schema 1, before lineage, with a version.
+        let mut conn = Connection::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(MIGRATIONS[0]).unwrap();
+        tx.pragma_update(None, "user_version", 1).unwrap();
+        tx.execute_batch(&format!(
+            "INSERT INTO models VALUES ('a', 'churn', '', 1, 'svc');
+             INSERT INTO versions VALUES ('a', 'churn', 1, '{DIGEST}', 'xgboost', 'onnx',
+                 '{{\"inputs\":[],\"outputs\":[]}}', '{{}}', '{{}}', 'candidate', 1, 'svc');"
+        ))
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
         let registry = Registry::open(&path).unwrap();
-        registry.create_model(actor("a"), "churn", "").unwrap();
+        let old = registry.get_version("a", "churn", 1).unwrap();
+        assert_eq!(old.lineage, Lineage::default());
         drop(registry);
         // Reopening keeps the data and the schema.
         let registry = Registry::open(&path).unwrap();

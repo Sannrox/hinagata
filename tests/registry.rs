@@ -102,6 +102,7 @@ fn version_request() -> RegisterVersionRequest {
         }),
         metrics: [("auc".to_string(), 0.88)].into(),
         tags: [("owner".to_string(), "risk".to_string())].into(),
+        ..Default::default()
     }
 }
 
