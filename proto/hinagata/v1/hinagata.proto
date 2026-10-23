@@ -42,6 +42,15 @@ service Hinagata {
   // corrupted artifact is refused with DATA_LOSS.
   rpc ReadArtifact(ReadArtifactRequest) returns (stream ArtifactChunk);
 
+  // Drift monitoring. A version's training baseline gives each feature's
+  // and output's bins; prediction summaries (format
+  // `hinagata.prediction-summary/v1`, no raw rows) use exactly those bins.
+  // Each summary gets PSI and binned KS per feature and output, and every
+  // value at or above the version's thresholds is a drift alert.
+  rpc PutDriftBaseline(PutDriftBaselineRequest) returns (PutDriftBaselineResponse);
+  rpc SubmitPredictionSummary(SubmitPredictionSummaryRequest) returns (DriftReport);
+  rpc ListDriftAlerts(ListDriftAlertsRequest) returns (ListDriftAlertsResponse);
+
   // Every change, oldest first, with its actor and the record before and
   // after.
   rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
@@ -256,4 +265,106 @@ message ReadArtifactRequest {
 
 message ArtifactChunk {
   bytes data = 1;
+}
+
+// `n` ascending edges give `n + 1` bins: below the first edge, between each
+// pair (lower edge inclusive), and at or above the last.
+message NumericBins {
+  repeated double edges = 1;
+  repeated uint64 counts = 2;
+}
+
+message CategoryCounts {
+  map<string, uint64> counts = 1;
+}
+
+message Distribution {
+  oneof bins {
+    NumericBins numeric = 1;
+    CategoryCounts categorical = 2;
+  }
+}
+
+message DriftBaseline {
+  map<string, Distribution> features = 1;
+  map<string, Distribution> outputs = 2;
+}
+
+// A value at or above a threshold alerts; an unset threshold never does.
+message DriftThresholds {
+  optional double psi = 1;
+  // At most 1.
+  optional double ks = 2;
+}
+
+message PutDriftBaselineRequest {
+  string model = 1;
+  uint64 version = 2;
+  // Fixed once set; setting the same baseline again may change thresholds.
+  DriftBaseline baseline = 3;
+  DriftThresholds thresholds = 4;
+}
+
+message PutDriftBaselineResponse {}
+
+message PredictionSummary {
+  // `hinagata.prediction-summary/v1`.
+  string format = 1;
+  // Unique per version; sending the same summary again is a no-op.
+  string summary_id = 2;
+  int64 window_start_ms = 3;
+  int64 window_end_ms = 4;
+  uint64 prediction_count = 5;
+  double latency_p50_ms = 6;
+  double latency_p95_ms = 7;
+  // Counts in the baseline's bins, for every baseline feature and output.
+  map<string, Distribution> features = 8;
+  map<string, Distribution> outputs = 9;
+}
+
+message SubmitPredictionSummaryRequest {
+  string model = 1;
+  uint64 version = 2;
+  PredictionSummary summary = 3;
+}
+
+message FeatureDrift {
+  // `feature` or `output`.
+  string role = 1;
+  string name = 2;
+  double psi = 3;
+  // Unset for categorical distributions.
+  optional double ks = 4;
+}
+
+message DriftAlert {
+  uint64 seq = 1;
+  int64 at_ms = 2;
+  string model = 3;
+  uint64 version = 4;
+  string summary_id = 5;
+  string role = 6;
+  string name = 7;
+  // `psi` or `ks`.
+  string metric = 8;
+  double value = 9;
+  double threshold = 10;
+}
+
+message DriftReport {
+  string summary_id = 1;
+  repeated FeatureDrift drift = 2;
+  // The alerts this summary raised.
+  repeated DriftAlert alerts = 3;
+}
+
+message ListDriftAlertsRequest {
+  // Only this model's alerts, when set.
+  string model = 1;
+  uint64 after_seq = 2;
+  uint32 limit = 3;
+}
+
+message ListDriftAlertsResponse {
+  repeated DriftAlert alerts = 1;
 }
