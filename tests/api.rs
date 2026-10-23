@@ -70,9 +70,21 @@ async fn server_with(
     let address = listener.local_addr().unwrap().to_string();
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let registry = Arc::new(hinagata::registry::Registry::open_in_memory().unwrap());
-    tokio::spawn(serve(Api::new(auth, registry), listener, tls, async {
-        let _ = stopped.await;
-    }));
+    tokio::spawn(serve(
+        Api::new(
+            auth,
+            registry,
+            Arc::new(hinagata::artifacts::ArtifactStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                1 << 20,
+            )),
+        ),
+        listener,
+        tls,
+        async {
+            let _ = stopped.await;
+        },
+    ));
     (address, stop)
 }
 

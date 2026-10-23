@@ -30,6 +30,18 @@ service Hinagata {
   // approval hook and is refused until one is configured.
   rpc SetVersionStage(SetVersionStageRequest) returns (Version);
 
+  // Artifacts are content-addressed bytes, stored once and read only by
+  // namespaces that uploaded them. An upload begins with the digest and
+  // size, takes chunks of up to 1 MiB at `received_bytes` (a resent chunk is
+  // a no-op, so an interrupted upload resumes), and completes only when the
+  // bytes hash to the digest. A version can only name a stored artifact.
+  rpc BeginArtifactUpload(BeginArtifactUploadRequest) returns (ArtifactUploadStatus);
+  rpc UploadArtifactChunk(UploadArtifactChunkRequest) returns (ArtifactUploadStatus);
+  rpc CompleteArtifactUpload(CompleteArtifactUploadRequest) returns (ArtifactUploadStatus);
+  // The artifact's bytes, after checking they still hash to the digest; a
+  // corrupted artifact is refused with DATA_LOSS.
+  rpc ReadArtifact(ReadArtifactRequest) returns (stream ArtifactChunk);
+
   // Every change, oldest first, with its actor and the record before and
   // after.
   rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
@@ -209,4 +221,39 @@ message ListAuditEventsRequest {
 
 message ListAuditEventsResponse {
   repeated AuditEvent events = 1;
+}
+
+message BeginArtifactUploadRequest {
+  // `sha256:<64 lowercase hex>`.
+  string digest = 1;
+  // At most the server's artifact limit.
+  uint64 size_bytes = 2;
+}
+
+message ArtifactUploadStatus {
+  string upload_id = 1;
+  string digest = 2;
+  uint64 size_bytes = 3;
+  // Send the next chunk from here.
+  uint64 received_bytes = 4;
+  // The artifact is stored for the caller's namespace.
+  bool complete = 5;
+}
+
+message UploadArtifactChunkRequest {
+  string upload_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+
+message CompleteArtifactUploadRequest {
+  string upload_id = 1;
+}
+
+message ReadArtifactRequest {
+  string digest = 1;
+}
+
+message ArtifactChunk {
+  bytes data = 1;
 }

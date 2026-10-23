@@ -27,6 +27,17 @@ Models and versions live in the caller's namespace, in one embedded database fil
 - Stages: a version starts as `candidate`. It moves between `candidate` and `staging`, and from either to `archived`, which is final. Promotion to `production` needs the approval hook and is refused until one is configured. `expected_stage` makes a change apply only if the version has not moved since it was read.
 - Every change is an audit event with its actor (the credential's subject), action, and the record before and after.
 
+## Artifacts
+
+Model artifacts are content-addressed: stored once by SHA-256 on local disk (`HINAGATA_ARTIFACT_DIR`, default `artifacts`) or in an S3-compatible bucket (`HINAGATA_S3_BUCKET`, with `HINAGATA_S3_ENDPOINT` for a non-AWS store and the standard `AWS_*` credentials). `HINAGATA_MAX_ARTIFACT_BYTES` caps one artifact (default 1 GiB).
+
+- `BeginArtifactUpload` declares the digest and size, and returns the upload and how many bytes it holds. Calling it again after an interruption tells where to continue.
+- `UploadArtifactChunk` sends up to 1 MiB at that offset. A resent chunk is a no-op; any other offset is refused, and a chunk past the declared size is refused as oversized.
+- `CompleteArtifactUpload` stores the artifact only if the bytes hash to the digest; otherwise the upload starts over.
+- `ReadArtifact` streams the bytes after checking that they still hash to the digest, and refuses a corrupted artifact with `DATA_LOSS`.
+
+A namespace reads only artifacts it uploaded, and a version can only name an artifact its namespace stored. Artifact bytes are gRPC only. Calling `BeginArtifactUpload` for a stored artifact whose bytes no longer verify reopens the upload, so its namespace can send them again. A failed write aborts its multipart upload; for uploads left unfinished by a crashed process, give the bucket a lifecycle rule that aborts incomplete multipart uploads.
+
 | HTTP | gRPC |
 | --- | --- |
 | `GET /v1/identity` | `GetIdentity` |
