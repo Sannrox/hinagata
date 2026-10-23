@@ -8,7 +8,9 @@ publish = false
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
 bytes = "1.12.1"
+ed25519-dalek = "2.2.0"
 futures = "0.3.34"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 object_store = { version = "0.14.2", features = ["aws"] }
@@ -30,7 +32,6 @@ protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-base64 = "0.22"
 rcgen = "0.14"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["io-util"] }

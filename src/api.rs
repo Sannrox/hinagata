@@ -89,6 +89,7 @@ pub struct Api {
     registry: Arc<Registry>,
     artifacts: Arc<ArtifactStore>,
     setup: Arc<Setup>,
+    signer: Option<Arc<crate::signing::Signer>>,
 }
 
 /// How the server is configured, without secrets: what the diagnostics
@@ -337,6 +338,7 @@ impl Api {
             registry,
             artifacts,
             setup: Arc::new(Setup::default()),
+            signer: None,
         }
     }
 
@@ -433,6 +435,38 @@ impl Api {
             "namespace": identity.namespace(),
             "namespace_totals": totals,
         }))
+    }
+
+    /// Sign version manifests with `signer`.
+    pub fn with_signer(mut self, signer: crate::signing::Signer) -> Self {
+        self.signer = Some(Arc::new(signer));
+        self
+    }
+
+    pub fn get_version_manifest(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetVersionManifestRequest,
+    ) -> Result<proto::VersionManifest, ApiError> {
+        let identity = self.identity(authorization)?;
+        let signer = self.signer.as_ref().ok_or_else(|| {
+            ApiError::from(RegistryError::Refused(
+                "this registry has no signing key".into(),
+            ))
+        })?;
+        let version =
+            self.registry
+                .get_version(identity.namespace(), &request.model, request.version)?;
+        let (envelope, metadata) = signer
+            .sign(identity.namespace(), &version)
+            .map_err(RegistryError::Storage)?;
+        Ok(proto::VersionManifest {
+            format: envelope.format,
+            key_id: envelope.key_id,
+            manifest: envelope.manifest,
+            signature: envelope.signature,
+            metadata,
+        })
     }
 
     /// Open or resume an upload. A stored artifact whose bytes no longer
@@ -1181,6 +1215,7 @@ grpc_methods! {
     list_versions_trained_on(ListVersionsTrainedOnRequest) -> ListVersionsResponse;
     set_version_stage(SetVersionStageRequest) -> Version;
     check_signature_compatibility(CheckSignatureCompatibilityRequest) -> CheckSignatureCompatibilityResponse;
+    get_version_manifest(GetVersionManifestRequest) -> VersionManifest;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
     put_drift_baseline(PutDriftBaselineRequest) -> PutDriftBaselineResponse;
     submit_prediction_summary(SubmitPredictionSummaryRequest) -> DriftReport;
@@ -1435,6 +1470,17 @@ pub fn http_router(api: Api) -> axum::Router {
                  headers: HeaderMap,
                  Query(request): Query<proto::ListDriftAlertsRequest>| async move {
                     call(api, &headers, request, Api::list_drift_alerts).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/manifest",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>| async move {
+                    let request = proto::GetVersionManifestRequest { model, version };
+                    call(api, &headers, request, Api::get_version_manifest).await
                 },
             ),
         )

@@ -34,6 +34,12 @@ service Hinagata {
   // caller of the first: a new input, an input of another type or shape or
   // that no longer accepts null, a removed output or one of another type or
   // shape. Check before promoting the second.
+  // A detached Ed25519 signature over the version's manifest: its
+  // namespace, model, number, artifact digest and metadata digest (format in
+  // docs/signatures.md). FAILED_PRECONDITION when the registry has no
+  // signing key.
+  rpc GetVersionManifest(GetVersionManifestRequest) returns (VersionManifest);
+
   rpc CheckSignatureCompatibility(CheckSignatureCompatibilityRequest) returns (CheckSignatureCompatibilityResponse);
 
   // Artifacts are content-addressed bytes, stored once and read only by
@@ -413,4 +419,22 @@ message ListDriftAlertsRequest {
 
 message ListDriftAlertsResponse {
   repeated DriftAlert alerts = 1;
+}
+
+message GetVersionManifestRequest {
+  string model = 1;
+  uint64 version = 2;
+}
+
+// The envelope `hinagata.signature/v1`, plus the metadata bytes it covers.
+message VersionManifest {
+  string format = 1;
+  string key_id = 2;
+  // The manifest bytes exactly as signed.
+  string manifest = 3;
+  // Base64 of the 64-byte Ed25519 signature over `manifest`.
+  string signature = 4;
+  // The version's metadata bytes; their SHA-256 is the manifest's
+  // `metadata_digest`.
+  string metadata = 5;
 }

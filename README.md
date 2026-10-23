@@ -28,6 +28,10 @@ Models and versions live in the caller's namespace, in one embedded database fil
 - Stages: a version starts as `candidate`. It moves between `candidate` and `staging`, and from either to `archived`, which is final. Promotion to `production` needs the approval hook and is refused until one is configured. `expected_stage` makes a change apply only if the version has not moved since it was read.
 - Every change is an audit event with its actor (the credential's subject), action, and the record before and after.
 
+## Signed manifests
+
+With `HINAGATA_SIGNING_KEY_FILE` (an Ed25519 seed as 64 hex characters) and `HINAGATA_SIGNING_KEY_ID`, `GetVersionManifest` returns a version's metadata and a detached signature over its manifest: namespace, model, version number, artifact digest and metadata digest. Anyone holding the public key can check, offline, that an artifact and its metadata came from this registry: `hinagata verify --keys trusted.json --envelope manifest.json --artifact model.onnx`. The format is in [docs/signatures.md](docs/signatures.md), so other verifiers need no Hinagata code. Without a key the call is refused.
+
 ## Artifacts
 
 Model artifacts are content-addressed: stored once by SHA-256 on local disk (`HINAGATA_ARTIFACT_DIR`, default `artifacts`) or in an S3-compatible bucket (`HINAGATA_S3_BUCKET`, with `HINAGATA_S3_ENDPOINT` for a non-AWS store and the standard `AWS_*` credentials). `HINAGATA_MAX_ARTIFACT_BYTES` caps one artifact (default 1 GiB).
@@ -50,6 +54,7 @@ A version can register a training baseline: per-feature bin edges and counts, pe
 | `GET /v1/models/{model}` | `GetModel` |
 | `POST /v1/models/{model}/versions`, `GET /v1/models/{model}/versions` | `RegisterVersion`, `ListVersions` |
 | `GET /v1/models/{model}/versions/{version}` | `GetVersion` |
+| `GET /v1/models/{model}/versions/{version}/manifest` | `GetVersionManifest` |
 | `GET /v1/models/{model}/signature-compatibility?from_version=…&to_version=…` | `CheckSignatureCompatibility` |
 | `GET /v1/lineage/trained-on?dataset_id=…&digest=…` | `ListVersionsTrainedOn` |
 | `POST /v1/models/{model}/versions/{version}/stage` | `SetVersionStage` |

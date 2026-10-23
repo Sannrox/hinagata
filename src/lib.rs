@@ -8,3 +8,4 @@ pub mod config;
 pub mod drift;
 pub mod registry;
 pub mod signature;
+pub mod signing;
