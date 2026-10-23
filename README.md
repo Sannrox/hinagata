@@ -47,6 +47,10 @@ A namespace reads only artifacts it uploaded, and a version can only name an art
 
 A version can register a training baseline: per-feature bin edges and counts, per-category counts, and the outputs' distributions, with PSI and KS alert thresholds. Serving and batch scoring send prediction summaries in those bins ([format](docs/prediction-summary.md), no raw rows). Each summary gets PSI and binned KS per feature and output, and every value at or above a threshold becomes a drift alert with its evidence.
 
+## Model quality
+
+Hinagata stores no predictions or labels. The caller joins labels to its own predictions and sends labeled aggregates ([format](docs/labeled-aggregate.md)): confusion counts and per-class score histograms for classifiers, error sums for regressors. Each gets accuracy, AUC and calibration error, or MAE and RMSE, and a metric past the version's quality thresholds is an alert in the drift alert stream.
+
 | HTTP | gRPC |
 | --- | --- |
 | `GET /v1/identity` | `GetIdentity` |
@@ -60,6 +64,8 @@ A version can register a training baseline: per-feature bin edges and counts, pe
 | `POST /v1/models/{model}/versions/{version}/stage` | `SetVersionStage` |
 | `POST /v1/models/{model}/versions/{version}/drift-baseline` | `PutDriftBaseline` |
 | `POST /v1/models/{model}/versions/{version}/prediction-summaries` | `SubmitPredictionSummary` |
+| `POST /v1/models/{model}/versions/{version}/quality-thresholds` | `PutQualityThresholds` |
+| `POST /v1/models/{model}/versions/{version}/labeled-aggregates` | `SubmitLabeledAggregate` |
 | `GET /v1/drift-alerts` | `ListDriftAlerts` |
 | `GET /v1/audit-events` | `ListAuditEvents` |
 
