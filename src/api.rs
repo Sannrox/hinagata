@@ -117,6 +117,91 @@ fn spec_out(spec: registry::TensorSpec) -> proto::TensorSpec {
     }
 }
 
+fn lineage_in(lineage: proto::Lineage) -> registry::Lineage {
+    let code = lineage.code.unwrap_or_default();
+    registry::Lineage {
+        training_datasets: lineage
+            .training_datasets
+            .into_iter()
+            .map(|dataset| registry::DatasetVersion {
+                dataset_id: dataset.dataset_id,
+                version: dataset.version,
+                digest: dataset.digest,
+            })
+            .collect(),
+        code: registry::CodeReference {
+            repository: code.repository,
+            commit: code.commit,
+            digest: code.digest,
+        },
+        parameters: lineage.parameters.into_iter().collect(),
+        run_receipt_id: lineage.run_receipt_id,
+        run_receipt_digest: lineage.run_receipt_digest,
+    }
+}
+
+fn lineage_out(lineage: registry::Lineage) -> proto::Lineage {
+    proto::Lineage {
+        training_datasets: lineage
+            .training_datasets
+            .into_iter()
+            .map(|dataset| proto::DatasetVersion {
+                dataset_id: dataset.dataset_id,
+                version: dataset.version,
+                digest: dataset.digest,
+            })
+            .collect(),
+        code: Some(proto::CodeReference {
+            repository: lineage.code.repository,
+            commit: lineage.code.commit,
+            digest: lineage.code.digest,
+        }),
+        parameters: lineage.parameters.into_iter().collect(),
+        run_receipt_id: lineage.run_receipt_id,
+        run_receipt_digest: lineage.run_receipt_digest,
+    }
+}
+
+/// The lineage a registration declares: as given, or derived from the
+/// training run receipt with the given repository, commit and parameters.
+fn declared_lineage(
+    lineage: Option<proto::Lineage>,
+    receipt: &str,
+    artifact_digest: &str,
+) -> Result<registry::Lineage, ApiError> {
+    let given = lineage_in(lineage.unwrap_or_default());
+    if receipt.is_empty() {
+        return Ok(given);
+    }
+    let invalid = |message: &str| {
+        ApiError::from(RegistryError::Invalid(format!(
+            "with a training run receipt, {message}"
+        )))
+    };
+    if !given.training_datasets.is_empty() {
+        return Err(invalid("the training datasets come from the receipt"));
+    }
+    let derived = registry::Lineage::from_run_receipt(receipt, artifact_digest)?;
+    let matches = |given: &str, derived: &str| given.is_empty() || given == derived;
+    if !matches(&given.run_receipt_id, &derived.run_receipt_id)
+        || !matches(&given.run_receipt_digest, &derived.run_receipt_digest)
+        || !matches(&given.code.digest, &derived.code.digest)
+    {
+        return Err(invalid(
+            "the run id, receipt digest and code digest must match it",
+        ));
+    }
+    Ok(registry::Lineage {
+        code: registry::CodeReference {
+            repository: given.code.repository,
+            commit: given.code.commit,
+            ..derived.code
+        },
+        parameters: given.parameters,
+        ..derived
+    })
+}
+
 fn version_out(version: registry::Version) -> proto::Version {
     proto::Version {
         model: version.model,
@@ -135,6 +220,7 @@ fn version_out(version: registry::Version) -> proto::Version {
         }),
         metrics: version.metrics.into_iter().collect(),
         tags: version.tags.into_iter().collect(),
+        lineage: Some(lineage_out(version.lineage)),
         stage: version.stage.as_str().into(),
         created_at_ms: version.created_at_ms,
         created_by: version.created_by,
@@ -208,6 +294,11 @@ impl Api {
     ) -> Result<proto::Version, ApiError> {
         let identity = self.identity(authorization)?;
         let signature = request.signature.unwrap_or_default();
+        let lineage = declared_lineage(
+            request.lineage,
+            &request.training_run_receipt_json,
+            &request.artifact_digest,
+        )?;
         let new = registry::NewVersion {
             artifact_digest: request.artifact_digest,
             framework: request.framework,
@@ -218,6 +309,7 @@ impl Api {
             },
             metrics: request.metrics.into_iter().collect(),
             tags: request.tags.into_iter().collect(),
+            lineage,
         };
         let version = self
             .registry
@@ -247,6 +339,25 @@ impl Api {
             identity.namespace(),
             &request.model,
             request.after,
+            request.limit,
+        )?;
+        Ok(proto::ListVersionsResponse {
+            versions: versions.into_iter().map(version_out).collect(),
+        })
+    }
+
+    pub fn list_versions_trained_on(
+        &self,
+        authorization: Option<&str>,
+        request: proto::ListVersionsTrainedOnRequest,
+    ) -> Result<proto::ListVersionsResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let digest = (!request.digest.is_empty()).then_some(request.digest.as_str());
+        let versions = self.registry.list_versions_trained_on(
+            identity.namespace(),
+            &request.dataset_id,
+            digest,
+            (&request.after_model, request.after_version),
             request.limit,
         )?;
         Ok(proto::ListVersionsResponse {
@@ -367,6 +478,7 @@ grpc_methods! {
     register_version(RegisterVersionRequest) -> Version;
     get_version(GetVersionRequest) -> Version;
     list_versions(ListVersionsRequest) -> ListVersionsResponse;
+    list_versions_trained_on(ListVersionsTrainedOnRequest) -> ListVersionsResponse;
     set_version_stage(SetVersionStageRequest) -> Version;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
 }
@@ -478,6 +590,16 @@ pub fn http_router(api: Api) -> axum::Router {
                         ..request
                     };
                     call(api, &headers, request, Api::set_version_stage).await
+                },
+            ),
+        )
+        .route(
+            "/v1/lineage/trained-on",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Query(request): Query<proto::ListVersionsTrainedOnRequest>| async move {
+                    call(api, &headers, request, Api::list_versions_trained_on).await
                 },
             ),
         )
