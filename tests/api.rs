@@ -69,7 +69,8 @@ async fn server_with(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let (stop, stopped) = tokio::sync::oneshot::channel();
-    tokio::spawn(serve(Api::new(auth), listener, tls, async {
+    let registry = Arc::new(hinagata::registry::Registry::open_in_memory().unwrap());
+    tokio::spawn(serve(Api::new(auth, registry), listener, tls, async {
         let _ = stopped.await;
     }));
     (address, stop)

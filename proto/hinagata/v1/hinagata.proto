@@ -8,6 +8,28 @@ package hinagata.v1;
 service Hinagata {
   // The identity the caller's credential resolves to.
   rpc GetIdentity(GetIdentityRequest) returns (GetIdentityResponse);
+
+  // Create a model in the caller's namespace. Creating it again with the
+  // same description returns it unchanged.
+  rpc CreateModel(CreateModelRequest) returns (Model);
+  rpc GetModel(GetModelRequest) returns (Model);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Register the next version of a model, in stage `candidate`. A version
+  // never changes once registered. Registering the same artifact with the
+  // same content returns the stored version; with other content it fails.
+  rpc RegisterVersion(RegisterVersionRequest) returns (Version);
+  rpc GetVersion(GetVersionRequest) returns (Version);
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+
+  // Move a version between stages: candidate and staging either way, and
+  // either of them to archived, which is final. Production needs an
+  // approval hook and is refused until one is configured.
+  rpc SetVersionStage(SetVersionStageRequest) returns (Version);
+
+  // Every change, oldest first, with its actor and the record before and
+  // after.
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
 }
 
 message GetIdentityRequest {}
@@ -17,4 +39,126 @@ message GetIdentityResponse {
   string namespace = 1;
   // The credential's subject; empty when it names none.
   string subject = 2;
+}
+
+message Model {
+  string name = 1;
+  string description = 2;
+  int64 created_at_ms = 3;
+  // The subject of the credential that created it.
+  string created_by = 4;
+}
+
+message CreateModelRequest {
+  // 1 to 128 of `A-Z a-z 0-9 . _ -`, starting with a letter or digit.
+  string name = 1;
+  string description = 2;
+}
+
+message GetModelRequest {
+  string name = 1;
+}
+
+message ListModelsRequest {
+  // Names after this one, in name order.
+  string after = 1;
+  // Default 100, at most 1000.
+  uint32 limit = 2;
+}
+
+message ListModelsResponse {
+  repeated Model models = 1;
+}
+
+// One declared input or output.
+message TensorSpec {
+  string name = 1;
+  string dtype = 2;
+  // Dimensions; -1 is a dynamic dimension.
+  repeated int64 shape = 3;
+  bool nullable = 4;
+}
+
+message Signature {
+  repeated TensorSpec inputs = 1;
+  repeated TensorSpec outputs = 2;
+}
+
+message Version {
+  string model = 1;
+  // 1 for the first version of a model, then counting up.
+  uint64 version = 2;
+  // `sha256:<64 lowercase hex>` of the artifact in the artifact store.
+  string artifact_digest = 3;
+  string framework = 4;
+  // `onnx`.
+  string format = 5;
+  Signature signature = 6;
+  map<string, double> metrics = 7;
+  map<string, string> tags = 8;
+  // `candidate`, `staging`, `production` or `archived`.
+  string stage = 9;
+  int64 created_at_ms = 10;
+  string created_by = 11;
+}
+
+message RegisterVersionRequest {
+  string model = 1;
+  string artifact_digest = 2;
+  string framework = 3;
+  string format = 4;
+  Signature signature = 5;
+  map<string, double> metrics = 6;
+  map<string, string> tags = 7;
+}
+
+message GetVersionRequest {
+  string model = 1;
+  uint64 version = 2;
+}
+
+message ListVersionsRequest {
+  string model = 1;
+  // Versions after this one, in version order.
+  uint64 after = 2;
+  uint32 limit = 3;
+}
+
+message ListVersionsResponse {
+  repeated Version versions = 1;
+}
+
+message SetVersionStageRequest {
+  string model = 1;
+  uint64 version = 2;
+  string stage = 3;
+  // When set, the change applies only while the version is still in this
+  // stage.
+  string expected_stage = 4;
+}
+
+message AuditEvent {
+  uint64 seq = 1;
+  int64 at_ms = 2;
+  string actor = 3;
+  // `model.created`, `version.registered` or `version.stage_changed`.
+  string action = 4;
+  string model = 5;
+  // Zero for model events.
+  uint64 version = 6;
+  // JSON of the record before and after; empty before a creation.
+  string before = 7;
+  string after = 8;
+}
+
+message ListAuditEventsRequest {
+  // Only this model's events, when set.
+  string model = 1;
+  // Events after this sequence number.
+  uint64 after_seq = 2;
+  uint32 limit = 3;
+}
+
+message ListAuditEventsResponse {
+  repeated AuditEvent events = 1;
 }

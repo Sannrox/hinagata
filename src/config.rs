@@ -10,6 +10,8 @@
 //!     `HINAGATA_JWT_ISSUER` and `HINAGATA_TENANT_CLAIM` (default `tenant`):
 //!     JWTs whose tenant claim is the namespace, verified against a local
 //!     JWKS file, so the server starts and runs offline.
+//! - `HINAGATA_DB_PATH`: the registry database file, default
+//!   `hinagata.db`. One server owns it.
 //! - `HINAGATA_TLS_CERT` and `HINAGATA_TLS_KEY` (PEM) serve over TLS; adding
 //!   `HINAGATA_TLS_CLIENT_CA` requires client certificates (mTLS).
 
@@ -17,6 +19,7 @@ use crate::auth::{Authenticator, Jwt, StaticToken};
 use std::sync::Arc;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7700";
+pub const DEFAULT_DB_PATH: &str = "hinagata.db";
 
 fn read(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<Option<String>, String> {
     var(name)
