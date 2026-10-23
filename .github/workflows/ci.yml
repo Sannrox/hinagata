@@ -40,11 +40,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Start an S3-compatible store
         run: |
-          docker run -d --name s3 -p 9090:9090 -e initialBuckets=hinagata-test adobe/s3mock
+          docker run -d --name s3 -p 9090:9090 \
+            -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS=hinagata-test adobe/s3mock
           for _ in $(seq 1 60); do
             curl -sf -o /dev/null http://127.0.0.1:9090/ && break
             sleep 1
           done
+          # Create the bucket too, in case the store ignores the setting.
+          curl -s -X PUT http://127.0.0.1:9090/hinagata-test || true
+          curl -sf -o /dev/null -I http://127.0.0.1:9090/hinagata-test
       - name: Artifact tests against it
         run: cargo test --locked --test artifacts
         env:
