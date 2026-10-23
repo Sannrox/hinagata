@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hinagata:batch-descriptor:v1",
+  "title": "Batch scoring descriptor",
+  "description": "What a batch runner needs to score a dataset or object set with a model version (docs/descriptors.md).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "namespace",
+    "model",
+    "version",
+    "artifact_digest",
+    "version_manifest",
+    "runtime",
+    "signature",
+    "monitoring",
+    "input",
+    "output",
+    "partitioning"
+  ],
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "artifact_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "version_manifest": {
+      "$ref": "#/$defs/version_manifest"
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "signature": {
+      "$ref": "#/$defs/signature"
+    },
+    "monitoring": {
+      "$ref": "#/$defs/monitoring"
+    },
+    "format": {
+      "const": "hinagata.batch-descriptor/v1"
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id",
+        "binding"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "dataset",
+            "object_set"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binding": {
+          "description": "How fields of the bound dataset or object type feed the inputs.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "target_kind",
+            "target",
+            "fields",
+            "inputs"
+          ],
+          "properties": {
+            "target_kind": {
+              "enum": [
+                "dataset",
+                "object_type"
+              ]
+            },
+            "target": {
+              "type": "string",
+              "minLength": 1
+            },
+            "fields": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/field"
+              }
+            },
+            "inputs": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dataset",
+        "fields"
+      ],
+      "properties": {
+        "dataset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "dtype",
+              "nullable",
+              "dimensions"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "dtype": {
+                "type": "string"
+              },
+              "nullable": {
+                "type": "boolean"
+              },
+              "dimensions": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": -1
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "partitioning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "column",
+        "partitions"
+      ],
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "partitions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        }
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "tensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "dtype",
+        "shape",
+        "nullable"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dtype": {
+          "type": "string",
+          "minLength": 1
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": -1
+          }
+        },
+        "nullable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputs",
+        "outputs"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tensor"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tensor"
+          }
+        }
+      }
+    },
+    "version_manifest": {
+      "description": "The version's GetVersionManifest response (docs/signatures.md).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "key_id",
+        "manifest",
+        "signature",
+        "metadata"
+      ],
+      "properties": {
+        "format": {
+          "const": "hinagata.signature/v1"
+        },
+        "key_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "manifest": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "metadata": {
+          "type": "string"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "image"
+      ],
+      "properties": {
+        "engine": {
+          "const": "onnx"
+        },
+        "image": {
+          "type": "string",
+          "description": "Empty for the deployer's default ONNX runtime image."
+        }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "format"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/v1/"
+        },
+        "format": {
+          "type": "string"
+        }
+      }
+    },
+    "monitoring": {
+      "description": "Registry paths that take this version's prediction summaries and labeled aggregates.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prediction_summaries",
+        "labeled_aggregates"
+      ],
+      "properties": {
+        "prediction_summaries": {
+          "$ref": "#/$defs/endpoint"
+        },
+        "labeled_aggregates": {
+          "$ref": "#/$defs/endpoint"
+        }
+      }
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "dtype",
+        "nullable"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dtype": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

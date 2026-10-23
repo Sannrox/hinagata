@@ -4,7 +4,7 @@ Hinagata is a standalone registry for classical machine learning models, written
 
 - Registers models and immutable, content-addressed model versions with their input and output schema, metrics and lineage (training dataset version, code reference, run receipt).
 - Promotes versions through stages with an approval hook that the caller governs.
-- Produces deployment descriptors: the deployer runs online scoring services, and the batch runner runs scoring jobs.
+- Produces signed deployment descriptors: the deployer runs online scoring services, and the batch runner runs scoring jobs.
 - Monitors deployed versions: prediction statistics, data drift and, once labels arrive, model quality, with alerts.
 
 Hinagata doesn't make governance decisions. A caller in front of it enforces policy. It stores artifacts on local disk or S3-compatible object storage, and runs as a single binary. Beyond an S3-compatible store, its only outbound call is the optional approval hook.
@@ -31,6 +31,10 @@ Models and versions live in the caller's namespace, in one embedded database fil
 ## Signed manifests
 
 With `HINAGATA_SIGNING_KEY_FILE` (an Ed25519 seed as 64 hex characters) and `HINAGATA_SIGNING_KEY_ID`, `GetVersionManifest` returns a version's metadata and a detached signature over its manifest: namespace, model, version number, artifact digest and metadata digest. Anyone holding the public key can check, offline, that an artifact and its metadata came from this registry: `hinagata verify --keys trusted.json --envelope manifest.json --artifact model.onnx`. The format is in [docs/signatures.md](docs/signatures.md), so other verifiers need no Hinagata code. Without a key the call is refused.
+
+## Deployment descriptors
+
+`GetOnlineDescriptor` and `GetBatchDescriptor` describe how to run a version: the artifact, runtime, resources, health contract and monitoring paths for a scoring service; or the input binding, output dataset schema and partitioning for a batch job. Each descriptor embeds the version's signed manifest and is signed by the registry. The formats are published as JSON Schemas ([descriptors](docs/descriptors.md)).
 
 ## Offline transfer
 
@@ -63,6 +67,7 @@ Hinagata stores no predictions or labels. The caller joins labels to its own pre
 | `POST /v1/models/{model}/versions`, `GET /v1/models/{model}/versions` | `RegisterVersion`, `ListVersions` |
 | `GET /v1/models/{model}/versions/{version}` | `GetVersion` |
 | `GET /v1/models/{model}/versions/{version}/manifest` | `GetVersionManifest` |
+| `POST /v1/models/{model}/versions/{version}/online-descriptor`, `.../batch-descriptor` | `GetOnlineDescriptor`, `GetBatchDescriptor` |
 | gRPC only | `ImportVersion` |
 | `GET /v1/models/{model}/signature-compatibility?from_version=…&to_version=…` | `CheckSignatureCompatibility` |
 | `GET /v1/lineage/trained-on?dataset_id=…&digest=…` | `ListVersionsTrainedOn` |

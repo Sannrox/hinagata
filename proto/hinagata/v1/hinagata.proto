@@ -46,6 +46,14 @@ service Hinagata {
   // docs/signatures.md). FAILED_PRECONDITION when the registry has no
   // signing key.
   rpc GetVersionManifest(GetVersionManifestRequest) returns (VersionManifest);
+  // Deployment descriptors (docs/descriptors.md, schemas in docs/schemas/):
+  // what a deployer needs to run a version as an online scoring service,
+  // and what a batch runner needs to score a dataset or object set. Each
+  // holds the version's signed manifest and is signed by the registry.
+  // FAILED_PRECONDITION without a signing key, and for batch, for a version
+  // bound to no dataset or object type.
+  rpc GetOnlineDescriptor(GetOnlineDescriptorRequest) returns (SignedDescriptor);
+  rpc GetBatchDescriptor(GetBatchDescriptorRequest) returns (SignedDescriptor);
   // Admit a version exported from another registry (docs/bundles.md): its
   // signed manifest is checked against this registry's trusted keys and its
   // metadata against the manifest, before anything is written. The
@@ -575,4 +583,44 @@ message ImportVersionRequest {
 message ImportVersionResponse {
   // Unset with `validate_only`.
   Version version = 1;
+}
+
+// Per replica, and replicas. Zero takes the default: 1000 millicores,
+// 512 MiB, one replica.
+message Resources {
+  uint32 cpu_millis = 1;
+  uint32 memory_mib = 2;
+  uint32 replicas = 3;
+}
+
+message GetOnlineDescriptorRequest {
+  string model = 1;
+  uint64 version = 2;
+  // Empty for the deployer's default ONNX runtime image.
+  string runtime_image = 3;
+  Resources resources = 4;
+}
+
+message GetBatchDescriptorRequest {
+  string model = 1;
+  uint64 version = 2;
+  string runtime_image = 3;
+  // The dataset version or object set to score, in the version's bound
+  // dataset or object type.
+  string input = 4;
+  string output_dataset = 5;
+  // A field of the binding to partition by; empty for none.
+  string partition_column = 6;
+  // Zero for one.
+  uint32 partitions = 7;
+}
+
+message SignedDescriptor {
+  // `hinagata.signed-descriptor/v1`.
+  string format = 1;
+  string key_id = 2;
+  // The descriptor: canonical JSON, exactly as signed.
+  string descriptor = 3;
+  // Base64 of the Ed25519 signature over `descriptor`.
+  string signature = 4;
 }

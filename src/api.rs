@@ -517,6 +517,94 @@ impl Api {
         self
     }
 
+    /// Build a descriptor for a version with `build` and sign it.
+    fn signed_descriptor(
+        &self,
+        authorization: Option<&str>,
+        model: &str,
+        version: u64,
+        build: impl FnOnce(
+            &str,
+            &registry::Version,
+            &serde_json::Value,
+        ) -> Result<serde_json::Value, RegistryError>,
+    ) -> Result<proto::SignedDescriptor, ApiError> {
+        let identity = self.identity(authorization)?;
+        let signer = self.signer.as_ref().ok_or_else(|| {
+            ApiError::from(RegistryError::Refused(
+                "this registry has no signing key, so it signs no descriptors".into(),
+            ))
+        })?;
+        let version = self
+            .registry
+            .get_version(identity.namespace(), model, version)?;
+        let (envelope, metadata) = signer
+            .sign(identity.namespace(), &version)
+            .map_err(RegistryError::Storage)?;
+        let manifest = serde_json::json!({
+            "format": envelope.format,
+            "key_id": envelope.key_id,
+            "manifest": envelope.manifest,
+            "signature": envelope.signature,
+            "metadata": metadata,
+        });
+        let descriptor =
+            crate::signing::canonical(&build(identity.namespace(), &version, &manifest)?)
+                .map_err(RegistryError::Storage)?;
+        Ok(proto::SignedDescriptor {
+            format: crate::descriptor::SIGNED_FORMAT.into(),
+            key_id: signer.key_id().into(),
+            signature: signer.sign_bytes(descriptor.as_bytes()),
+            descriptor,
+        })
+    }
+
+    pub fn get_online_descriptor(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetOnlineDescriptorRequest,
+    ) -> Result<proto::SignedDescriptor, ApiError> {
+        let resources = request.resources.unwrap_or_default();
+        let options = crate::descriptor::OnlineOptions {
+            runtime_image: request.runtime_image,
+            resources: crate::descriptor::Resources {
+                cpu_millis: resources.cpu_millis,
+                memory_mib: resources.memory_mib,
+                replicas: resources.replicas,
+            },
+        };
+        self.signed_descriptor(
+            authorization,
+            &request.model,
+            request.version,
+            |namespace, version, manifest| {
+                crate::descriptor::online(namespace, version, manifest, &options)
+            },
+        )
+    }
+
+    pub fn get_batch_descriptor(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetBatchDescriptorRequest,
+    ) -> Result<proto::SignedDescriptor, ApiError> {
+        let options = crate::descriptor::BatchOptions {
+            runtime_image: request.runtime_image,
+            input: request.input,
+            output_dataset: request.output_dataset,
+            partition_column: request.partition_column,
+            partitions: request.partitions,
+        };
+        self.signed_descriptor(
+            authorization,
+            &request.model,
+            request.version,
+            |namespace, version, manifest| {
+                crate::descriptor::batch(namespace, version, manifest, &options)
+            },
+        )
+    }
+
     pub fn get_version_manifest(
         &self,
         authorization: Option<&str>,
@@ -1522,6 +1610,8 @@ grpc_methods! {
     get_promotion_gates(GetPromotionGatesRequest) -> PromotionGates;
     check_signature_compatibility(CheckSignatureCompatibilityRequest) -> CheckSignatureCompatibilityResponse;
     get_version_manifest(GetVersionManifestRequest) -> VersionManifest;
+    get_online_descriptor(GetOnlineDescriptorRequest) -> SignedDescriptor;
+    get_batch_descriptor(GetBatchDescriptorRequest) -> SignedDescriptor;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
     put_drift_baseline(PutDriftBaselineRequest) -> PutDriftBaselineResponse;
     submit_prediction_summary(SubmitPredictionSummaryRequest) -> DriftReport;
@@ -1850,6 +1940,38 @@ pub fn http_router(api: Api) -> axum::Router {
                  headers: HeaderMap,
                  Query(request): Query<proto::ListDriftAlertsRequest>| async move {
                     call(api, &headers, request, Api::list_drift_alerts).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/online-descriptor",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Json(request): Json<proto::GetOnlineDescriptorRequest>| async move {
+                    let request = proto::GetOnlineDescriptorRequest {
+                        model,
+                        version,
+                        ..request
+                    };
+                    call(api, &headers, request, Api::get_online_descriptor).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/batch-descriptor",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Json(request): Json<proto::GetBatchDescriptorRequest>| async move {
+                    let request = proto::GetBatchDescriptorRequest {
+                        model,
+                        version,
+                        ..request
+                    };
+                    call(api, &headers, request, Api::get_batch_descriptor).await
                 },
             ),
         )

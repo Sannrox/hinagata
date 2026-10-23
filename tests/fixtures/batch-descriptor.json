@@ -1,0 +1,125 @@
+{
+  "artifact_digest": "sha256:5f228f72d2ee00a313c9b403b458ae7fb4826bc0df1a3547d5e1a8ae83babeb0",
+  "format": "hinagata.batch-descriptor/v1",
+  "input": {
+    "binding": {
+      "fields": [
+        {
+          "dtype": "string",
+          "name": "customer_id",
+          "nullable": false
+        },
+        {
+          "dtype": "string",
+          "name": "region",
+          "nullable": false
+        },
+        {
+          "dtype": "int16",
+          "name": "age",
+          "nullable": false
+        },
+        {
+          "dtype": "float32",
+          "name": "tenure",
+          "nullable": false
+        },
+        {
+          "dtype": "float32",
+          "name": "spend",
+          "nullable": false
+        }
+      ],
+      "inputs": {
+        "features": [
+          "age",
+          "tenure",
+          "spend"
+        ]
+      },
+      "target": "customers",
+      "target_kind": "dataset"
+    },
+    "id": "customers@2026-10-01",
+    "kind": "dataset"
+  },
+  "model": "churn",
+  "monitoring": {
+    "labeled_aggregates": {
+      "format": "hinagata.labeled-aggregate/v1",
+      "path": "/v1/models/churn/versions/1/labeled-aggregates"
+    },
+    "prediction_summaries": {
+      "format": "hinagata.prediction-summary/v1",
+      "path": "/v1/models/churn/versions/1/prediction-summaries"
+    }
+  },
+  "namespace": "tenant-a",
+  "output": {
+    "dataset": "churn_scores",
+    "fields": [
+      {
+        "dimensions": [
+          1
+        ],
+        "dtype": "float32",
+        "name": "score",
+        "nullable": false
+      },
+      {
+        "dimensions": [],
+        "dtype": "int64",
+        "name": "label",
+        "nullable": false
+      }
+    ]
+  },
+  "partitioning": {
+    "column": "region",
+    "partitions": 8
+  },
+  "runtime": {
+    "engine": "onnx",
+    "image": ""
+  },
+  "signature": {
+    "inputs": [
+      {
+        "dtype": "float32",
+        "name": "features",
+        "nullable": false,
+        "shape": [
+          -1,
+          3
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "dtype": "float32",
+        "name": "score",
+        "nullable": false,
+        "shape": [
+          -1,
+          1
+        ]
+      },
+      {
+        "dtype": "int64",
+        "name": "label",
+        "nullable": false,
+        "shape": [
+          -1
+        ]
+      }
+    ]
+  },
+  "version": 1,
+  "version_manifest": {
+    "format": "hinagata.signature/v1",
+    "key_id": "registry-1",
+    "manifest": "{\"artifact_digest\":\"sha256:5f228f72d2ee00a313c9b403b458ae7fb4826bc0df1a3547d5e1a8ae83babeb0\",\"format\":\"hinagata.version-manifest/v1\",\"metadata_digest\":\"sha256:4a13d9f7416da36aa57e3a8126505b3be4f27a36a4d1949b34f008c3cc1c4209\",\"model\":\"churn\",\"namespace\":\"tenant-a\",\"version\":1}",
+    "metadata": "{\"artifact_digest\":\"sha256:5f228f72d2ee00a313c9b403b458ae7fb4826bc0df1a3547d5e1a8ae83babeb0\",\"binding\":{\"fields\":[{\"dtype\":\"string\",\"name\":\"customer_id\",\"nullable\":false},{\"dtype\":\"string\",\"name\":\"region\",\"nullable\":false},{\"dtype\":\"int16\",\"name\":\"age\",\"nullable\":false},{\"dtype\":\"float32\",\"name\":\"tenure\",\"nullable\":false},{\"dtype\":\"float32\",\"name\":\"spend\",\"nullable\":false}],\"inputs\":{\"features\":[\"age\",\"tenure\",\"spend\"]},\"target\":\"customers\",\"target_kind\":\"dataset\"},\"format\":\"onnx\",\"framework\":\"lightgbm\",\"lineage\":{\"code\":{\"commit\":\"\",\"digest\":\"\",\"repository\":\"\"},\"parameters\":{},\"run_receipt_digest\":\"\",\"run_receipt_id\":\"\",\"training_datasets\":[]},\"metrics\":{},\"signature\":{\"inputs\":[{\"dtype\":\"float32\",\"name\":\"features\",\"nullable\":false,\"shape\":[-1,3]}],\"outputs\":[{\"dtype\":\"float32\",\"name\":\"score\",\"nullable\":false,\"shape\":[-1,1]},{\"dtype\":\"int64\",\"name\":\"label\",\"nullable\":false,\"shape\":[-1]}]},\"tags\":{}}",
+    "signature": "im50HtmA+9we+wkMlOVYOlQ7jUVz3KdVIT4/xrYj2CtJ43wMVHd62B2JRaaA2lhO6jAo6/YNIjRGylDjVwvFAQ=="
+  }
+}

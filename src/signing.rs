@@ -28,7 +28,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 /// Compact JSON with object keys sorted, as the format defines it.
-fn canonical(value: &impl Serialize) -> Result<String, String> {
+pub fn canonical(value: &impl Serialize) -> Result<String, String> {
     // `serde_json::Value` keeps object keys sorted, so going through it
     // sorts every level.
     let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
@@ -115,6 +115,11 @@ impl Signer {
 
     pub fn key_id(&self) -> &str {
         &self.key_id
+    }
+
+    /// Base64 (standard, padded) of the Ed25519 signature over `bytes`.
+    pub fn sign_bytes(&self, bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.key.sign(bytes).to_bytes())
     }
 
     /// The envelope for `version` in `namespace`, and the metadata bytes it
