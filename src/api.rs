@@ -92,6 +92,7 @@ pub struct Api {
     setup: Arc<Setup>,
     signer: Option<Arc<crate::signing::Signer>>,
     approval_hook: Option<Arc<crate::promotion::ApprovalHook>>,
+    trusted_keys: Option<Arc<crate::signing::TrustedKeys>>,
 }
 
 /// How the server is configured, without secrets: what the diagnostics
@@ -342,6 +343,7 @@ impl Api {
             setup: Arc::new(Setup::default()),
             signer: None,
             approval_hook: None,
+            trusted_keys: None,
         }
     }
 
@@ -349,6 +351,69 @@ impl Api {
     pub fn with_approval_hook(mut self, hook: crate::promotion::ApprovalHook) -> Self {
         self.approval_hook = Some(Arc::new(hook));
         self
+    }
+
+    /// Admit imported versions signed by `keys`.
+    pub fn with_trusted_keys(mut self, keys: crate::signing::TrustedKeys) -> Self {
+        self.trusted_keys = Some(Arc::new(keys));
+        self
+    }
+
+    /// Check an imported version and register it; see `ImportVersion`.
+    pub async fn import_version(
+        &self,
+        authorization: Option<String>,
+        request: proto::ImportVersionRequest,
+    ) -> Result<proto::ImportVersionResponse, ApiError> {
+        let identity = self.identity(authorization.as_deref())?;
+        let keys = self.trusted_keys.as_ref().ok_or_else(|| {
+            ApiError::from(RegistryError::Refused(
+                "this registry trusts no signing keys, so it imports nothing".into(),
+            ))
+        })?;
+        let invalid = |message: String| ApiError::from(RegistryError::Invalid(message));
+        let bundled = request.manifest.unwrap_or_default();
+        let envelope = crate::signing::Envelope {
+            format: bundled.format,
+            key_id: bundled.key_id,
+            manifest: bundled.manifest,
+            signature: bundled.signature,
+        };
+        let manifest = keys.verify(&envelope).map_err(invalid)?;
+        crate::signing::check_contents(&manifest, None, Some(bundled.metadata.as_bytes()))
+            .map_err(invalid)?;
+        let new = crate::signing::parse_metadata(&bundled.metadata).map_err(invalid)?;
+        if request.validate_only {
+            return Ok(proto::ImportVersionResponse { version: None });
+        }
+        // The source read the signature from the graph or checked it
+        // against it; this registry checks again with its own reader.
+        if new.format == "onnx" {
+            let checked = self
+                .onnx_signature(&identity, &new.artifact_digest, new.signature.clone())
+                .await?;
+            if checked != new.signature {
+                return Err(invalid(
+                    "the signed signature does not match the ONNX graph".into(),
+                ));
+            }
+        }
+        let provenance = serde_json::json!({
+            "source_namespace": manifest.namespace,
+            "source_model": manifest.model,
+            "source_version": manifest.version,
+            "key_id": envelope.key_id,
+            "artifact_digest": manifest.artifact_digest,
+            "metadata_digest": manifest.metadata_digest,
+        });
+        let registry = self.registry.clone();
+        let version = blocking(move || {
+            Ok(registry.import_version(actor(&identity), &manifest.model, new, &provenance)?)
+        })
+        .await?;
+        Ok(proto::ImportVersionResponse {
+            version: Some(version_out(version)),
+        })
     }
 
     /// The configuration the diagnostics bundle reports.
@@ -1479,6 +1544,15 @@ grpc_methods! {
         ) -> Result<tonic::Response<proto::Version>, tonic::Status> {
             let auth = metadata_auth(&request);
             let response = Api::set_version_stage(self, auth, request.into_inner()).await?;
+            Ok(tonic::Response::new(response))
+        }
+
+        async fn import_version(
+            &self,
+            request: tonic::Request<proto::ImportVersionRequest>,
+        ) -> Result<tonic::Response<proto::ImportVersionResponse>, tonic::Status> {
+            let auth = metadata_auth(&request);
+            let response = Api::import_version(self, auth, request.into_inner()).await?;
             Ok(tonic::Response::new(response))
         }
 

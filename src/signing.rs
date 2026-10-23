@@ -200,6 +200,54 @@ impl TrustedKeys {
     }
 }
 
+/// The version content in signed metadata bytes. Refused unless the bytes
+/// are exactly what [`metadata`] gives for that content, so nothing is
+/// admitted that the signature does not cover.
+pub fn parse_metadata(raw: &str) -> Result<crate::registry::NewVersion, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Content {
+        artifact_digest: String,
+        framework: String,
+        format: String,
+        signature: crate::registry::Signature,
+        metrics: BTreeMap<String, f64>,
+        tags: BTreeMap<String, String>,
+        lineage: crate::registry::Lineage,
+        binding: Option<crate::signature::Binding>,
+    }
+    let content: Content =
+        serde_json::from_str(raw).map_err(|error| format!("metadata: {error}"))?;
+    let version = Version {
+        model: String::new(),
+        version: 0,
+        artifact_digest: content.artifact_digest,
+        framework: content.framework,
+        format: content.format,
+        signature: content.signature,
+        metrics: content.metrics,
+        tags: content.tags,
+        lineage: content.lineage,
+        binding: content.binding,
+        stage: crate::registry::Stage::Candidate,
+        created_at_ms: 0,
+        created_by: String::new(),
+    };
+    if metadata(&version)? != raw {
+        return Err("the metadata is not in canonical form".into());
+    }
+    Ok(crate::registry::NewVersion {
+        artifact_digest: version.artifact_digest,
+        framework: version.framework,
+        format: version.format,
+        signature: version.signature,
+        metrics: version.metrics,
+        tags: version.tags,
+        lineage: version.lineage,
+        binding: version.binding,
+    })
+}
+
 /// Check an artifact and its metadata bytes against a verified manifest.
 pub fn check_contents(
     manifest: &Manifest,

@@ -23,6 +23,8 @@
 //!   change, sending the bearer token in `HINAGATA_APPROVAL_TOKEN_FILE` when
 //!   set, and waiting `HINAGATA_APPROVAL_TIMEOUT_MS` (default 10 s, at most
 //!   60 s) before denying.
+//! - `HINAGATA_TRUSTED_KEYS_FILE` lists the signing keys whose exported
+//!   versions `ImportVersion` admits (the `hinagata verify` keys format).
 //! - `HINAGATA_TLS_CERT` and `HINAGATA_TLS_KEY` (PEM) serve over TLS; adding
 //!   `HINAGATA_TLS_CLIENT_CA` requires client certificates (mTLS).
 
@@ -128,6 +130,15 @@ pub fn approval_hook(
     };
     crate::promotion::ApprovalHook::new(&url, token, std::time::Duration::from_millis(timeout_ms))
         .map(Some)
+}
+
+/// The keys imported versions must be signed with, if any.
+pub fn trusted_keys(
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Option<crate::signing::TrustedKeys>, String> {
+    read(&var, "HINAGATA_TRUSTED_KEYS_FILE")?
+        .map(|text| crate::signing::TrustedKeys::from_json(&text))
+        .transpose()
 }
 
 /// The TLS configuration, if any. Any TLS setting without a full server

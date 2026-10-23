@@ -4,6 +4,7 @@
 pub mod api;
 pub mod artifacts;
 pub mod auth;
+pub mod bundle;
 pub mod config;
 pub mod drift;
 pub mod promotion;
