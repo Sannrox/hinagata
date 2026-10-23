@@ -91,6 +91,7 @@ pub struct Api {
     artifacts: Arc<ArtifactStore>,
     setup: Arc<Setup>,
     signer: Option<Arc<crate::signing::Signer>>,
+    approval_hook: Option<Arc<crate::promotion::ApprovalHook>>,
 }
 
 /// How the server is configured, without secrets: what the diagnostics
@@ -340,7 +341,14 @@ impl Api {
             artifacts,
             setup: Arc::new(Setup::default()),
             signer: None,
+            approval_hook: None,
         }
+    }
+
+    /// Ask `hook` about every stage change ([`crate::promotion`]).
+    pub fn with_approval_hook(mut self, hook: crate::promotion::ApprovalHook) -> Self {
+        self.approval_hook = Some(Arc::new(hook));
+        self
     }
 
     /// The configuration the diagnostics bundle reports.
@@ -971,25 +979,148 @@ impl Api {
         })
     }
 
-    pub fn set_version_stage(
+    /// Change a version's stage. With an approval hook, the change is
+    /// checked (including the model's promotion gates for production), the
+    /// hook is asked, and the change applies only on an allow; a deny is
+    /// audited and refused with the hook's reason.
+    pub async fn set_version_stage(
         &self,
-        authorization: Option<&str>,
+        authorization: Option<String>,
         request: proto::SetVersionStageRequest,
     ) -> Result<proto::Version, ApiError> {
-        let identity = self.identity(authorization)?;
+        let identity = self.identity(authorization.as_deref())?;
         let stage = Stage::parse(&request.stage)?;
         let expected = match request.expected_stage.as_str() {
             "" => None,
             value => Some(Stage::parse(value)?),
         };
-        let version = self.registry.set_stage(
+        let Some(hook) = self.approval_hook.clone() else {
+            let registry = self.registry.clone();
+            return blocking(move || {
+                let version = registry.set_stage(
+                    actor(&identity),
+                    &request.model,
+                    request.version,
+                    stage,
+                    expected,
+                )?;
+                Ok(version_out(version))
+            })
+            .await;
+        };
+        let signed = self.signer.is_some();
+        let pending = {
+            let (registry, namespace, model) = (
+                self.registry.clone(),
+                identity.namespace().to_string(),
+                request.model.clone(),
+            );
+            let version = request.version;
+            blocking(move || {
+                Ok(registry
+                    .prepare_stage_change(&namespace, &model, version, stage, expected, signed)?)
+            })
+            .await?
+        };
+        if pending.version.stage == stage {
+            return Ok(version_out(pending.version));
+        }
+        let manifest = match &self.signer {
+            Some(signer) => {
+                let (envelope, metadata) = signer
+                    .sign(identity.namespace(), &pending.version)
+                    .map_err(RegistryError::Storage)?;
+                serde_json::json!({
+                    "format": envelope.format,
+                    "key_id": envelope.key_id,
+                    "manifest": envelope.manifest,
+                    "signature": envelope.signature,
+                    "metadata": metadata,
+                })
+            }
+            None => serde_json::Value::Null,
+        };
+        let request_id = crate::promotion::request_id(
+            identity.namespace(),
+            identity.subject(),
+            &pending,
+            stage,
+            &manifest,
+        );
+        let decision = hook
+            .decide(&serde_json::json!({
+                "format": crate::promotion::REQUEST_FORMAT,
+                "request_id": request_id,
+                "namespace": identity.namespace(),
+                "actor": identity.subject(),
+                "model": pending.version.model,
+                "version": pending.version.version,
+                "from_stage": pending.version.stage.as_str(),
+                "to_stage": stage.as_str(),
+                "artifact_digest": pending.version.artifact_digest,
+                "metrics": pending.version.metrics,
+                "gates": pending.gates,
+                "manifest": manifest,
+            }))
+            .await;
+        let registry = self.registry.clone();
+        blocking(move || {
+            if decision.allow {
+                let version = registry.apply_approved_stage(
+                    actor(&identity),
+                    &pending,
+                    &request_id,
+                    stage,
+                    &decision,
+                    signed,
+                )?;
+                return Ok(version_out(version));
+            }
+            registry.record_stage_denial(
+                actor(&identity),
+                &pending,
+                &request_id,
+                stage,
+                &decision,
+            )?;
+            Err(RegistryError::Refused(format!(
+                "the approval hook denied the change: {}",
+                decision.reason
+            ))
+            .into())
+        })
+        .await
+    }
+
+    pub fn put_promotion_gates(
+        &self,
+        authorization: Option<&str>,
+        request: proto::PutPromotionGatesRequest,
+    ) -> Result<proto::PromotionGates, ApiError> {
+        let identity = self.identity(authorization)?;
+        let gates = request.gates.unwrap_or_default();
+        let gates = self.registry.put_promotion_gates(
             actor(&identity),
             &request.model,
-            request.version,
-            stage,
-            expected,
+            &crate::promotion::Gates {
+                min_metrics: gates.min_metrics.into_iter().collect(),
+                require_compatible_signature: gates.require_compatible_signature,
+                require_signed_manifest: gates.require_signed_manifest,
+            },
         )?;
-        Ok(version_out(version))
+        Ok(gates_out(gates))
+    }
+
+    pub fn get_promotion_gates(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetPromotionGatesRequest,
+    ) -> Result<proto::PromotionGates, ApiError> {
+        let identity = self.identity(authorization)?;
+        Ok(gates_out(
+            self.registry
+                .promotion_gates(identity.namespace(), &request.model)?,
+        ))
     }
 
     pub fn put_drift_baseline(
@@ -1254,6 +1385,14 @@ fn alert_out(alert: drift::DriftAlert) -> proto::DriftAlert {
 
 /// The acting identity: its namespace scopes the write, its subject is
 /// recorded as the actor.
+fn gates_out(gates: crate::promotion::Gates) -> proto::PromotionGates {
+    proto::PromotionGates {
+        min_metrics: gates.min_metrics.into_iter().collect(),
+        require_compatible_signature: gates.require_compatible_signature,
+        require_signed_manifest: gates.require_signed_manifest,
+    }
+}
+
 fn actor(identity: &Identity) -> Actor<'_> {
     Actor {
         namespace: identity.namespace(),
@@ -1314,7 +1453,8 @@ grpc_methods! {
     get_version(GetVersionRequest) -> Version;
     list_versions(ListVersionsRequest) -> ListVersionsResponse;
     list_versions_trained_on(ListVersionsTrainedOnRequest) -> ListVersionsResponse;
-    set_version_stage(SetVersionStageRequest) -> Version;
+    put_promotion_gates(PutPromotionGatesRequest) -> PromotionGates;
+    get_promotion_gates(GetPromotionGatesRequest) -> PromotionGates;
     check_signature_compatibility(CheckSignatureCompatibilityRequest) -> CheckSignatureCompatibilityResponse;
     get_version_manifest(GetVersionManifestRequest) -> VersionManifest;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
@@ -1330,6 +1470,15 @@ grpc_methods! {
         ) -> Result<tonic::Response<proto::Version>, tonic::Status> {
             let auth = metadata_auth(&request);
             let response = Api::register_version(self, auth, request.into_inner()).await?;
+            Ok(tonic::Response::new(response))
+        }
+
+        async fn set_version_stage(
+            &self,
+            request: tonic::Request<proto::SetVersionStageRequest>,
+        ) -> Result<tonic::Response<proto::Version>, tonic::Status> {
+            let auth = metadata_auth(&request);
+            let response = Api::set_version_stage(self, auth, request.into_inner()).await?;
             Ok(tonic::Response::new(response))
         }
 
@@ -1520,7 +1669,29 @@ pub fn http_router(api: Api) -> axum::Router {
                         version,
                         ..request
                     };
-                    call(api, &headers, request, Api::set_version_stage).await
+                    let auth = header_auth(&headers).map(str::to_string);
+                    api.set_version_stage(auth, request).await.map(Json)
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/promotion-gates",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path(model): Path<String>,
+                 Json(gates): Json<proto::PromotionGates>| async move {
+                    let request = proto::PutPromotionGatesRequest {
+                        model,
+                        gates: Some(gates),
+                    };
+                    call(api, &headers, request, Api::put_promotion_gates).await
+                },
+            )
+            .get(
+                |State(api): State<Api>, headers: HeaderMap, Path(model): Path<String>| async move {
+                    let request = proto::GetPromotionGatesRequest { model };
+                    call(api, &headers, request, Api::get_promotion_gates).await
                 },
             ),
         )

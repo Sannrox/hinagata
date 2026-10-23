@@ -854,6 +854,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustls",
  "serde",
@@ -867,6 +868,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "url",
 ]
 
 [[package]]

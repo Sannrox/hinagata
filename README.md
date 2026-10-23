@@ -7,7 +7,7 @@ Hinagata is a standalone registry for classical machine learning models, written
 - Produces deployment descriptors: the deployer runs online scoring services, and the batch runner runs scoring jobs.
 - Monitors deployed versions: prediction statistics, data drift and, once labels arrive, model quality, with alerts.
 
-Hinagata doesn't make governance decisions. A caller in front of it enforces policy. It stores artifacts on local disk or S3-compatible object storage, and runs as a single binary with no runtime network calls.
+Hinagata doesn't make governance decisions. A caller in front of it enforces policy. It stores artifacts on local disk or S3-compatible object storage, and runs as a single binary. Beyond an S3-compatible store, its only outbound call is the optional approval hook.
 
 ## Run
 
@@ -25,7 +25,7 @@ Models and versions live in the caller's namespace, in one embedded database fil
 - A version records the artifact digest (`sha256:<hex>`), framework, format (`onnx`), signature, metrics and tags. It is numbered 1, 2, … per model and never changes once registered. Registering the same artifact again with the same content returns the stored version; with other content it is refused.
 - Signatures: for an ONNX artifact the signature is read from the model graph when omitted, and a declared one must match it. A version can be bound to a dataset schema or an object type, given inline: each input takes a field of its name, or `n` fields in order for a `[batch, n]` tensor, and registration refuses a field that does not widen to the input's type or may be null where the input may not. `CheckSignatureCompatibility` lists the changes between two versions that break a caller of the first: new inputs, changed input or output types or shapes, inputs that stop accepting null, and removed outputs.
 - Lineage: each version records its training dataset versions (id, version, digest), code reference (repository, commit, code digest), parameters and the training run's receipt id, all fixed at registration. Registering with `training_run_receipt_json` (a batch runner receipt, schema 6) takes the datasets, run id and code digest from the receipt, records the receipt's digest, and refuses an artifact the run did not produce. `ListVersionsTrainedOn` answers the reverse question: which versions were trained on a dataset, optionally at one digest.
-- Stages: a version starts as `candidate`. It moves between `candidate` and `staging`, and from either to `archived`, which is final. Promotion to `production` needs the approval hook and is refused until one is configured. `expected_stage` makes a change apply only if the version has not moved since it was read.
+- Stages: a version starts as `candidate`. It moves between `candidate` and `staging`, and from any stage but `archived` to `archived`, which is final. A caller-governed approval hook (`HINAGATA_APPROVAL_URL`) decides every change once configured, and promotion to `production` is refused without one. A model can require gates before production: metric minimums, signature compatibility with the versions in production, and a signed manifest. An approved change records the approver and decision reference ([promotion](docs/promotion.md)). `expected_stage` makes a change apply only if the version has not moved since it was read.
 - Every change is an audit event with its actor (the credential's subject), action, and the record before and after.
 
 ## Signed manifests
@@ -62,6 +62,7 @@ Hinagata stores no predictions or labels. The caller joins labels to its own pre
 | `GET /v1/models/{model}/signature-compatibility?from_version=…&to_version=…` | `CheckSignatureCompatibility` |
 | `GET /v1/lineage/trained-on?dataset_id=…&digest=…` | `ListVersionsTrainedOn` |
 | `POST /v1/models/{model}/versions/{version}/stage` | `SetVersionStage` |
+| `POST /v1/models/{model}/promotion-gates`, `GET /v1/models/{model}/promotion-gates` | `PutPromotionGates`, `GetPromotionGates` |
 | `POST /v1/models/{model}/versions/{version}/drift-baseline` | `PutDriftBaseline` |
 | `POST /v1/models/{model}/versions/{version}/prediction-summaries` | `SubmitPredictionSummary` |
 | `POST /v1/models/{model}/versions/{version}/quality-thresholds` | `PutQualityThresholds` |

@@ -144,6 +144,7 @@ BEGIN
 END;
 "#,
     crate::quality::MIGRATION,
+    crate::promotion::MIGRATION,
 ];
 
 /// Most items one list call returns.
@@ -221,12 +222,12 @@ impl Stage {
     }
 
     /// Whether a version may move from `self` to `to`. Production needs
-    /// the caller-governed approval hook, which is not available yet, so
-    /// every promotion to it is refused. Archived is final.
-    fn check_transition(self, to: Self) -> Result<()> {
+    /// an allow from the caller-governed approval hook
+    /// ([`crate::promotion`]). Archived is final.
+    pub(crate) fn check_transition(self, to: Self, approved: bool) -> Result<()> {
         match (self, to) {
-            (_, Self::Production) => Err(RegistryError::Refused(
-                "promotion to production needs an approval hook, and none is configured".into(),
+            (_, Self::Production) if !approved => Err(RegistryError::Refused(
+                "promotion to production needs an allow from the approval hook, and none is configured".into(),
             )),
             (Self::Archived, _) => Err(RegistryError::Refused(
                 "an archived version stays archived".into(),
@@ -1126,7 +1127,7 @@ impl Registry {
             if before.stage == stage {
                 return Ok(before);
             }
-            before.stage.check_transition(stage)?;
+            before.stage.check_transition(stage, false)?;
             tx.execute(
                 "UPDATE versions SET stage = ?4 WHERE namespace = ?1 AND model = ?2 AND version = ?3",
                 params![actor.namespace, model, version, stage.as_str()],
@@ -1296,7 +1297,7 @@ fn model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Model> {
     })
 }
 
-fn load_model(conn: &Connection, namespace: &str, name: &str) -> Result<Option<Model>> {
+pub(crate) fn load_model(conn: &Connection, namespace: &str, name: &str) -> Result<Option<Model>> {
     Ok(conn
         .query_row(
             "SELECT name, description, created_at_ms, created_by FROM models
