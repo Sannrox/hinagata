@@ -63,6 +63,15 @@ service Hinagata {
   rpc SubmitPredictionSummary(SubmitPredictionSummaryRequest) returns (DriftReport);
   rpc ListDriftAlerts(ListDriftAlertsRequest) returns (ListDriftAlertsResponse);
 
+  // Model quality. The caller joins labels to its own predictions and sends
+  // labeled aggregates (format `hinagata.labeled-aggregate/v1`): confusion
+  // counts and per-class score histograms, or error sums. Each gets
+  // accuracy, AUC and calibration error, or MAE and RMSE, and every metric
+  // past the version's thresholds is an alert with role `quality` in the
+  // drift alert stream.
+  rpc PutQualityThresholds(PutQualityThresholdsRequest) returns (PutQualityThresholdsResponse);
+  rpc SubmitLabeledAggregate(SubmitLabeledAggregateRequest) returns (QualityReport);
+
   // Every change, oldest first, with its actor and the record before and
   // after.
   rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
@@ -437,4 +446,88 @@ message VersionManifest {
   // The version's metadata bytes; their SHA-256 is the manifest's
   // `metadata_digest`.
   string metadata = 5;
+}
+
+// `min_*` alert below, `max_*` at or above; unset never alerts.
+message QualityThresholds {
+  optional double min_accuracy = 1;
+  optional double min_auc = 2;
+  optional double max_calibration_error = 3;
+  optional double max_mae = 4;
+  optional double max_rmse = 5;
+}
+
+message PutQualityThresholdsRequest {
+  string model = 1;
+  uint64 version = 2;
+  QualityThresholds thresholds = 3;
+}
+
+message PutQualityThresholdsResponse {}
+
+// One class's predicted probability against the labels, in 100 bins: bin
+// `i` holds scores in `[i / 100, (i + 1) / 100)`, a score of 1 the last.
+message ScoreHistogram {
+  // Rows labeled with the class.
+  repeated uint64 positive_counts = 1;
+  // Rows labeled otherwise.
+  repeated uint64 negative_counts = 2;
+  // The sum of the class's predicted probability over each bin's rows.
+  repeated double score_sums = 3;
+}
+
+message ConfusionRow {
+  // Rows of one actual label, by predicted label, in label order.
+  repeated uint64 counts = 1;
+}
+
+message ClassifierAggregate {
+  repeated string labels = 1;
+  // One row per actual label, in label order.
+  repeated ConfusionRow confusion = 2;
+  // Optional per class; AUC and calibration need one.
+  map<string, ScoreHistogram> score_histograms = 3;
+}
+
+message RegressorAggregate {
+  uint64 count = 1;
+  double absolute_error_sum = 2;
+  double squared_error_sum = 3;
+}
+
+message LabeledAggregate {
+  // `hinagata.labeled-aggregate/v1`.
+  string format = 1;
+  // Unique per version; sending the same aggregate again is a no-op.
+  string aggregate_id = 2;
+  int64 window_start_ms = 3;
+  int64 window_end_ms = 4;
+  oneof kind {
+    ClassifierAggregate classifier = 5;
+    RegressorAggregate regressor = 6;
+  }
+}
+
+message SubmitLabeledAggregateRequest {
+  string model = 1;
+  uint64 version = 2;
+  LabeledAggregate aggregate = 3;
+}
+
+message QualityMetric {
+  // `model`, or the class for `auc` and `calibration_error`.
+  string name = 1;
+  // `accuracy`, `auc`, `calibration_error`, `mae` or `rmse`.
+  string metric = 2;
+  double value = 3;
+  // For `auc`: the most it can differ from the AUC of the raw scores.
+  double tolerance = 4;
+}
+
+message QualityReport {
+  string aggregate_id = 1;
+  uint64 label_count = 2;
+  repeated QualityMetric metrics = 3;
+  // The alerts this aggregate raised.
+  repeated DriftAlert alerts = 4;
 }

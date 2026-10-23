@@ -143,6 +143,7 @@ BEGIN
     SELECT RAISE(ABORT, 'a registered version is immutable');
 END;
 "#,
+    crate::quality::MIGRATION,
 ];
 
 /// Most items one list call returns.

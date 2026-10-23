@@ -5,6 +5,7 @@
 use crate::artifacts::{ArtifactError, ArtifactStore, MAX_CHUNK_BYTES};
 use crate::auth::{AuthError, Authenticator, Identity, bearer};
 use crate::drift;
+use crate::quality;
 use crate::registry::{self, Actor, Registry, RegistryError, Stage};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -397,7 +398,7 @@ impl Api {
                 ),
                 (
                     "hinagata_drift_alerts",
-                    "Drift alerts raised.",
+                    "Drift and quality alerts raised.",
                     totals.drift_alerts,
                 ),
                 (
@@ -1060,6 +1061,106 @@ impl Api {
         })
     }
 
+    pub fn put_quality_thresholds(
+        &self,
+        authorization: Option<&str>,
+        request: proto::PutQualityThresholdsRequest,
+    ) -> Result<proto::PutQualityThresholdsResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let thresholds = request.thresholds.unwrap_or_default();
+        self.registry.put_quality_thresholds(
+            actor(&identity),
+            &request.model,
+            request.version,
+            quality::QualityThresholds {
+                min_accuracy: thresholds.min_accuracy,
+                min_auc: thresholds.min_auc,
+                max_calibration_error: thresholds.max_calibration_error,
+                max_mae: thresholds.max_mae,
+                max_rmse: thresholds.max_rmse,
+            },
+        )?;
+        Ok(proto::PutQualityThresholdsResponse {})
+    }
+
+    pub fn submit_labeled_aggregate(
+        &self,
+        authorization: Option<&str>,
+        request: proto::SubmitLabeledAggregateRequest,
+    ) -> Result<proto::QualityReport, ApiError> {
+        use proto::labeled_aggregate::Kind;
+        let identity = self.identity(authorization)?;
+        let aggregate = request.aggregate.unwrap_or_default();
+        if aggregate.format != quality::AGGREGATE_FORMAT {
+            return Err(RegistryError::Invalid(format!(
+                "aggregate format must be {}",
+                quality::AGGREGATE_FORMAT
+            ))
+            .into());
+        }
+        let kind = match aggregate.kind {
+            Some(Kind::Classifier(classifier)) => quality::Aggregate::Classifier {
+                labels: classifier.labels,
+                confusion: classifier
+                    .confusion
+                    .into_iter()
+                    .map(|row| row.counts)
+                    .collect(),
+                score_histograms: classifier
+                    .score_histograms
+                    .into_iter()
+                    .map(|(class, histogram)| {
+                        (
+                            class,
+                            quality::ScoreHistogram {
+                                positive_counts: histogram.positive_counts,
+                                negative_counts: histogram.negative_counts,
+                                score_sums: histogram.score_sums,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            Some(Kind::Regressor(regressor)) => quality::Aggregate::Regressor {
+                count: regressor.count,
+                absolute_error_sum: regressor.absolute_error_sum,
+                squared_error_sum: regressor.squared_error_sum,
+            },
+            None => {
+                return Err(RegistryError::Invalid(
+                    "an aggregate is a classifier or a regressor".into(),
+                )
+                .into());
+            }
+        };
+        let report = self.registry.submit_labeled_aggregate(
+            actor(&identity),
+            &request.model,
+            request.version,
+            &quality::LabeledAggregate {
+                aggregate_id: aggregate.aggregate_id,
+                window_start_ms: aggregate.window_start_ms,
+                window_end_ms: aggregate.window_end_ms,
+                aggregate: kind,
+            },
+        )?;
+        Ok(proto::QualityReport {
+            aggregate_id: report.aggregate_id,
+            label_count: report.label_count,
+            metrics: report
+                .metrics
+                .into_iter()
+                .map(|metric| proto::QualityMetric {
+                    name: metric.name,
+                    metric: metric.metric,
+                    value: metric.value,
+                    tolerance: metric.tolerance,
+                })
+                .collect(),
+            alerts: report.alerts.into_iter().map(alert_out).collect(),
+        })
+    }
+
     pub fn list_drift_alerts(
         &self,
         authorization: Option<&str>,
@@ -1220,6 +1321,8 @@ grpc_methods! {
     put_drift_baseline(PutDriftBaselineRequest) -> PutDriftBaselineResponse;
     submit_prediction_summary(SubmitPredictionSummaryRequest) -> DriftReport;
     list_drift_alerts(ListDriftAlertsRequest) -> ListDriftAlertsResponse;
+    put_quality_thresholds(PutQualityThresholdsRequest) -> PutQualityThresholdsResponse;
+    submit_labeled_aggregate(SubmitLabeledAggregateRequest) -> QualityReport;
     {
         async fn register_version(
             &self,
@@ -1460,6 +1563,38 @@ pub fn http_router(api: Api) -> axum::Router {
                         summary: Some(summary),
                     };
                     call(api, &headers, request, Api::submit_prediction_summary).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/quality-thresholds",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Json(thresholds): Json<proto::QualityThresholds>| async move {
+                    let request = proto::PutQualityThresholdsRequest {
+                        model,
+                        version,
+                        thresholds: Some(thresholds),
+                    };
+                    call(api, &headers, request, Api::put_quality_thresholds).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/labeled-aggregates",
+            post(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Json(aggregate): Json<proto::LabeledAggregate>| async move {
+                    let request = proto::SubmitLabeledAggregateRequest {
+                        model,
+                        version,
+                        aggregate: Some(aggregate),
+                    };
+                    call(api, &headers, request, Api::submit_labeled_aggregate).await
                 },
             ),
         )
