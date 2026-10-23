@@ -58,3 +58,43 @@ jobs:
           AWS_ACCESS_KEY_ID: testkey
           AWS_SECRET_ACCESS_KEY: testsecret123
           AWS_REGION: us-east-1
+  static-image:
+    name: Static image without network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t hinagata:ci .
+      - name: The binary is static
+        run: |
+          id=$(docker create hinagata:ci)
+          docker cp "$id":/hinagata ./hinagata-static
+          docker cp "$id":/etc/ssl/certs/ca-certificates.crt ./ca-certificates.crt
+          docker rm "$id"
+          test -s ca-certificates.crt
+          file hinagata-static | tee /dev/stderr | grep -qE "static(ally|-pie) linked"
+      - name: It serves with networking disabled
+        run: |
+          echo ci-token > token
+          chmod 644 token
+          docker run -d --name hinagata --network none \
+            -v "$PWD/token:/run/token:ro" \
+            -e HINAGATA_STATIC_TOKEN_FILE=/run/token -e HINAGATA_STATIC_NAMESPACE=ci \
+            hinagata:ci
+          # A probe that shares the server's network namespace, which has
+          # only loopback.
+          docker run --rm --network container:hinagata alpine sh -ec '
+            for _ in $(seq 1 30); do wget -qO /dev/null http://127.0.0.1:7700/healthz && break; sleep 1; done
+            wget -qO- http://127.0.0.1:7700/healthz | grep -q "\"ok\""
+            wget -qO- --header "authorization: Bearer ci-token" http://127.0.0.1:7700/v1/identity | grep -q "\"ci\""
+            wget -qO- http://127.0.0.1:7700/metrics | grep -q "hinagata_up 1"
+            ! wget -q -T 3 -O /dev/null http://example.com'
+          docker logs hinagata
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

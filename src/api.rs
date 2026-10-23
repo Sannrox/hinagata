@@ -88,6 +88,19 @@ pub struct Api {
     auth: Arc<dyn Authenticator>,
     registry: Arc<Registry>,
     artifacts: Arc<ArtifactStore>,
+    setup: Arc<Setup>,
+}
+
+/// How the server is configured, without secrets: what the diagnostics
+/// bundle reports.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Setup {
+    /// `static_token` or `jwt`.
+    pub auth: String,
+    /// `local` or `s3`.
+    pub artifact_store: String,
+    pub tls: bool,
+    pub mutual_tls: bool,
 }
 
 impl From<ArtifactError> for ApiError {
@@ -323,7 +336,103 @@ impl Api {
             auth,
             registry,
             artifacts,
+            setup: Arc::new(Setup::default()),
         }
+    }
+
+    /// The configuration the diagnostics bundle reports.
+    pub fn with_setup(mut self, setup: Setup) -> Self {
+        self.setup = Arc::new(setup);
+        self
+    }
+
+    /// Which parts cannot do work: the registry database and the artifact
+    /// store each get a probe.
+    async fn failing(&self) -> Vec<&'static str> {
+        let registry = self.registry.clone();
+        let mut failing = Vec::new();
+        if blocking(move || Ok(registry.health()?)).await.is_err() {
+            failing.push("registry");
+        }
+        if self.artifacts.health().await.is_err() {
+            failing.push("artifact_store");
+        }
+        failing
+    }
+
+    /// Prometheus text: build, health and registry counts over all
+    /// namespaces. No names, no per-tenant figures.
+    async fn metrics(&self) -> String {
+        let up = self.failing().await.is_empty();
+        let registry = self.registry.clone();
+        let totals = blocking(move || Ok(registry.totals(None)?)).await.ok();
+        let mut text = format!(
+            "# HELP hinagata_build_info The running build.\n\
+             # TYPE hinagata_build_info gauge\n\
+             hinagata_build_info{{version=\"{}\"}} 1\n\
+             # HELP hinagata_up Whether the registry and the artifact store answer.\n\
+             # TYPE hinagata_up gauge\n\
+             hinagata_up {}\n",
+            env!("CARGO_PKG_VERSION"),
+            u8::from(up)
+        );
+        if let Some(totals) = totals {
+            for (name, help, value) in [
+                (
+                    "hinagata_models",
+                    "Models in all namespaces.",
+                    totals.models,
+                ),
+                (
+                    "hinagata_versions",
+                    "Versions in all namespaces.",
+                    totals.versions,
+                ),
+                (
+                    "hinagata_artifacts",
+                    "Stored artifacts, per namespace that stored them.",
+                    totals.artifacts,
+                ),
+                (
+                    "hinagata_drift_alerts",
+                    "Drift alerts raised.",
+                    totals.drift_alerts,
+                ),
+                (
+                    "hinagata_schema_version",
+                    "Registry database schema version.",
+                    totals.schema_version,
+                ),
+            ] {
+                text.push_str(&format!(
+                    "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+                ));
+            }
+        }
+        text
+    }
+
+    /// The diagnostics bundle for an authenticated caller: build, schema,
+    /// configuration without secrets, health, and its namespace's counts.
+    /// It never includes credentials, paths, bucket names or artifacts.
+    pub async fn diagnostics(
+        &self,
+        authorization: Option<String>,
+    ) -> Result<serde_json::Value, ApiError> {
+        let identity = self.identity(authorization.as_deref())?;
+        let failing = self.failing().await;
+        let (registry, namespace) = (self.registry.clone(), identity.namespace().to_string());
+        let totals = blocking(move || Ok(registry.totals(Some(&namespace))?)).await?;
+        Ok(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "schema_version": totals.schema_version,
+            "setup": &*self.setup,
+            "max_artifact_bytes": self.artifacts.max_bytes(),
+            "healthy": failing.is_empty(),
+            "failing": failing,
+            "namespace": identity.namespace(),
+            "namespace_totals": totals,
+        }))
     }
 
     /// Open or resume an upload. A stored artifact whose bytes no longer
@@ -1151,6 +1260,45 @@ async fn call<Req: Send + 'static, Res: Send + 'static>(
 /// in JSON; path segments fill the model and version.
 pub fn http_router(api: Api) -> axum::Router {
     axum::Router::new()
+        // Health and metrics answer without a credential: they report only
+        // whether the server can work, and totals.
+        .route(
+            "/healthz",
+            get(|State(api): State<Api>| async move {
+                let failing = api.failing().await;
+                let status = if failing.is_empty() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                (
+                    status,
+                    Json(serde_json::json!({
+                        "status": if failing.is_empty() { "ok" } else { "unavailable" },
+                        "failing": failing,
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/metrics",
+            get(|State(api): State<Api>| async move {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4",
+                    )],
+                    api.metrics().await,
+                )
+            }),
+        )
+        .route(
+            "/v1/diagnostics",
+            get(|State(api): State<Api>, headers: HeaderMap| async move {
+                let auth = header_auth(&headers).map(str::to_string);
+                api.diagnostics(auth).await.map(Json)
+            }),
+        )
         .route(
             "/v1/identity",
             get(|State(api): State<Api>, headers: HeaderMap| async move {

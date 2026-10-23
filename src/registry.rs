@@ -411,6 +411,16 @@ pub struct ArtifactUpload {
     pub complete: bool,
 }
 
+/// Registry counts over all namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Totals {
+    pub models: u64,
+    pub versions: u64,
+    pub artifacts: u64,
+    pub drift_alerts: u64,
+    pub schema_version: u64,
+}
+
 /// Who acts and when. The API fills it from the authenticated identity.
 #[derive(Debug, Clone, Copy)]
 pub struct Actor<'a> {
@@ -469,6 +479,49 @@ impl Registry {
             .lock()
             .map_err(|_| RegistryError::Storage("registry lock poisoned".into()))?;
         apply(&conn)
+    }
+
+    /// Whether the database answers from its file: the health check's
+    /// registry probe reads the schema version and a page of each table the
+    /// API serves from.
+    pub fn health(&self) -> Result<()> {
+        self.read(|conn| {
+            let schema: usize = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if schema != MIGRATIONS.len() {
+                return Err(RegistryError::Storage(format!(
+                    "the registry database is at schema {schema}, not {}",
+                    MIGRATIONS.len()
+                )));
+            }
+            for table in ["models", "versions", "artifacts", "audit_events"] {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM (SELECT 1 FROM {table} LIMIT 1)"),
+                    [],
+                    |_| Ok(()),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Counts over all namespaces, or one namespace's.
+    pub fn totals(&self, namespace: Option<&str>) -> Result<Totals> {
+        self.read(|conn| {
+            let count = |table: &str| -> Result<u64> {
+                Ok(conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE ?1 IS NULL OR namespace = ?1"),
+                    params![namespace],
+                    |row| row.get(0),
+                )?)
+            };
+            Ok(Totals {
+                models: count("models")?,
+                versions: count("versions")?,
+                artifacts: count("artifacts")?,
+                drift_alerts: count("drift_alerts")?,
+                schema_version: conn.pragma_query_value(None, "user_version", |row| row.get(0))?,
+            })
+        })
     }
 
     /// Create a model. Creating it again with the same description returns
