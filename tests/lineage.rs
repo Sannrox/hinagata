@@ -128,6 +128,15 @@ fn from_receipt(artifact_digest: &str) -> RegisterVersionRequest {
         artifact_digest: artifact_digest.into(),
         framework: "lightgbm".into(),
         format: "onnx".into(),
+        signature: Some(hinagata::api::proto::Signature {
+            inputs: vec![hinagata::api::proto::TensorSpec {
+                name: "features".into(),
+                dtype: "float32".into(),
+                shape: vec![-1, 4],
+                nullable: false,
+            }],
+            outputs: vec![],
+        }),
         metrics: [("auc".to_string(), 0.87)].into(),
         lineage: Some(Lineage {
             code: Some(CodeReference {

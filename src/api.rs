@@ -239,6 +239,54 @@ fn declared_lineage(
     })
 }
 
+/// Signature reads at registration that may hold an artifact in memory at once.
+static SIGNATURE_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Largest ONNX artifact whose signature is read at registration.
+const MAX_SIGNATURE_READ_BYTES: u64 = 256 * 1024 * 1024;
+
+fn binding_in(binding: proto::SignatureBinding) -> crate::signature::Binding {
+    crate::signature::Binding {
+        target_kind: binding.target_kind,
+        target: binding.target,
+        fields: binding
+            .fields
+            .into_iter()
+            .map(|field| crate::signature::Field {
+                name: field.name,
+                dtype: field.dtype,
+                nullable: field.nullable,
+            })
+            .collect(),
+        inputs: binding
+            .inputs
+            .into_iter()
+            .map(|(input, fields)| (input, fields.fields))
+            .collect(),
+    }
+}
+
+fn binding_out(binding: crate::signature::Binding) -> proto::SignatureBinding {
+    proto::SignatureBinding {
+        target_kind: binding.target_kind,
+        target: binding.target,
+        fields: binding
+            .fields
+            .into_iter()
+            .map(|field| proto::BindingField {
+                name: field.name,
+                dtype: field.dtype,
+                nullable: field.nullable,
+            })
+            .collect(),
+        inputs: binding
+            .inputs
+            .into_iter()
+            .map(|(input, fields)| (input, proto::InputFields { fields }))
+            .collect(),
+    }
+}
+
 fn version_out(version: registry::Version) -> proto::Version {
     proto::Version {
         model: version.model,
@@ -258,6 +306,7 @@ fn version_out(version: registry::Version) -> proto::Version {
         metrics: version.metrics.into_iter().collect(),
         tags: version.tags.into_iter().collect(),
         lineage: Some(lineage_out(version.lineage)),
+        binding: version.binding.map(binding_out),
         stage: version.stage.as_str().into(),
         created_at_ms: version.created_at_ms,
         created_by: version.created_by,
@@ -549,13 +598,41 @@ impl Api {
         })
     }
 
-    pub fn register_version(
+    /// Register a version. For an ONNX artifact the signature comes from the
+    /// model graph when omitted, and must match it when given.
+    pub async fn register_version(
         &self,
-        authorization: Option<&str>,
+        authorization: Option<String>,
         request: proto::RegisterVersionRequest,
     ) -> Result<proto::Version, ApiError> {
-        let identity = self.identity(authorization)?;
-        let signature = request.signature.unwrap_or_default();
+        let identity = self.identity(authorization.as_deref())?;
+        let declared = request.signature.unwrap_or_default();
+        let declared = registry::Signature {
+            inputs: declared.inputs.into_iter().map(spec_in).collect(),
+            outputs: declared.outputs.into_iter().map(spec_in).collect(),
+        };
+        // A retry of a stored registration keeps the signature it stored,
+        // including one from before signatures were checked against the
+        // graph; the registry compares the rest.
+        let existing = {
+            let (registry, namespace, model, digest) = (
+                self.registry.clone(),
+                identity.namespace().to_string(),
+                request.model.clone(),
+                request.artifact_digest.clone(),
+            );
+            blocking(move || Ok(registry.version_for_artifact(&namespace, &model, &digest)?))
+                .await?
+        };
+        let signature =
+            if let Some(existing) = existing.filter(|existing| existing.signature == declared) {
+                existing.signature
+            } else if request.format == "onnx" {
+                self.onnx_signature(&identity, &request.artifact_digest, declared)
+                    .await?
+            } else {
+                declared
+            };
         let lineage = declared_lineage(
             request.lineage,
             &request.training_run_receipt_json,
@@ -565,18 +642,141 @@ impl Api {
             artifact_digest: request.artifact_digest,
             framework: request.framework,
             format: request.format,
-            signature: registry::Signature {
-                inputs: signature.inputs.into_iter().map(spec_in).collect(),
-                outputs: signature.outputs.into_iter().map(spec_in).collect(),
-            },
+            signature,
             metrics: request.metrics.into_iter().collect(),
             tags: request.tags.into_iter().collect(),
             lineage,
+            binding: request.binding.map(binding_in),
         };
-        let version = self
-            .registry
-            .register_version(actor(&identity), &request.model, new)?;
+        let (registry, namespace, subject, model) = (
+            self.registry.clone(),
+            identity.namespace().to_string(),
+            identity.subject().to_string(),
+            request.model,
+        );
+        let version = blocking(move || {
+            let actor = Actor {
+                namespace: &namespace,
+                subject: &subject,
+                now_ms: now_ms(),
+            };
+            Ok(registry.register_version(actor, &model, new)?)
+        })
+        .await?;
         Ok(version_out(version))
+    }
+
+    /// The signature of a stored ONNX artifact: read from its graph, or the
+    /// declared one when it matches. An artifact too large to read here needs
+    /// a declared signature. An unstored one keeps the declaration, and
+    /// registration refuses it anyway.
+    async fn onnx_signature(
+        &self,
+        identity: &Identity,
+        digest: &str,
+        declared: registry::Signature,
+    ) -> Result<registry::Signature, ApiError> {
+        use futures::StreamExt;
+        let (registry, namespace, key) = (
+            self.registry.clone(),
+            identity.namespace().to_string(),
+            digest.to_string(),
+        );
+        let size = blocking(move || Ok(registry.artifact_size(&namespace, &key)?)).await?;
+        match size {
+            None => return Ok(declared),
+            Some(size) if size > MAX_SIGNATURE_READ_BYTES => {
+                return if declared.inputs.is_empty() {
+                    Err(RegistryError::Invalid(format!(
+                        "declare a signature: the artifact is over {MAX_SIGNATURE_READ_BYTES} bytes, too large to read one from"
+                    ))
+                    .into())
+                } else {
+                    Ok(declared)
+                };
+            }
+            Some(_) => {}
+        }
+        // Reading and parsing a large model is bounded: at most a few at once,
+        // and the parse runs on the blocking pool.
+        let permit = SIGNATURE_READS
+            .acquire()
+            .await
+            .map_err(|_| ApiError::from(RegistryError::Storage("signature reads closed".into())))?;
+        let mut bytes = Vec::new();
+        let mut stream = self
+            .artifacts
+            .read_verified(digest.trim_start_matches("sha256:"))
+            .await?;
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        let invalid = |message: String| ApiError::from(RegistryError::Invalid(message));
+        // The permit moves into the parse, so a cancelled request cannot free
+        // it while the parse still holds the bytes.
+        let graph = match blocking(move || {
+            let _permit = permit;
+            Ok(crate::signature::read_graph(&bytes))
+        })
+        .await?
+        {
+            Ok(graph) => graph,
+            // A graph too large to read cannot be checked, so it is refused.
+            Err(error) if error.starts_with(crate::signature::LIMIT_ERROR) => {
+                return Err(invalid(error));
+            }
+            // Not an ONNX model at all: there is nothing to check the
+            // declaration against.
+            Err(error) if declared.inputs.is_empty() => {
+                return Err(invalid(format!(
+                    "declare a signature: none could be read from the artifact ({error})"
+                )));
+            }
+            Err(_) => return Ok(declared),
+        };
+        if declared.inputs.is_empty() && declared.outputs.is_empty() {
+            let take = |values: Vec<crate::signature::GraphValue>| {
+                values
+                    .iter()
+                    .map(|value| {
+                        value.spec().map_err(|why| {
+                            invalid(format!("declare a signature: the graph cannot give {why}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            return Ok(registry::Signature {
+                inputs: take(graph.0)?,
+                outputs: take(graph.1)?,
+            });
+        }
+        crate::signature::verify_against_graph(&declared, &graph).map_err(|why| {
+            invalid(format!(
+                "the declared signature does not match the ONNX graph: {why}"
+            ))
+        })?;
+        Ok(declared)
+    }
+
+    pub fn check_signature_compatibility(
+        &self,
+        authorization: Option<&str>,
+        request: proto::CheckSignatureCompatibilityRequest,
+    ) -> Result<proto::CheckSignatureCompatibilityResponse, ApiError> {
+        let identity = self.identity(authorization)?;
+        let from = self.registry.get_version(
+            identity.namespace(),
+            &request.model,
+            request.from_version,
+        )?;
+        let to =
+            self.registry
+                .get_version(identity.namespace(), &request.model, request.to_version)?;
+        let breaking = crate::signature::breaking_changes(&from.signature, &to.signature);
+        Ok(proto::CheckSignatureCompatibilityResponse {
+            compatible: breaking.is_empty(),
+            breaking,
+        })
     }
 
     pub fn get_version(
@@ -867,16 +1067,25 @@ grpc_methods! {
     create_model(CreateModelRequest) -> Model;
     get_model(GetModelRequest) -> Model;
     list_models(ListModelsRequest) -> ListModelsResponse;
-    register_version(RegisterVersionRequest) -> Version;
     get_version(GetVersionRequest) -> Version;
     list_versions(ListVersionsRequest) -> ListVersionsResponse;
     list_versions_trained_on(ListVersionsTrainedOnRequest) -> ListVersionsResponse;
     set_version_stage(SetVersionStageRequest) -> Version;
+    check_signature_compatibility(CheckSignatureCompatibilityRequest) -> CheckSignatureCompatibilityResponse;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
     put_drift_baseline(PutDriftBaselineRequest) -> PutDriftBaselineResponse;
     submit_prediction_summary(SubmitPredictionSummaryRequest) -> DriftReport;
     list_drift_alerts(ListDriftAlertsRequest) -> ListDriftAlertsResponse;
     {
+        async fn register_version(
+            &self,
+            request: tonic::Request<proto::RegisterVersionRequest>,
+        ) -> Result<tonic::Response<proto::Version>, tonic::Status> {
+            let auth = metadata_auth(&request);
+            let response = Api::register_version(self, auth, request.into_inner()).await?;
+            Ok(tonic::Response::new(response))
+        }
+
         async fn begin_artifact_upload(
             &self,
             request: tonic::Request<proto::BeginArtifactUploadRequest>,
@@ -988,7 +1197,8 @@ pub fn http_router(api: Api) -> axum::Router {
                  Path(model): Path<String>,
                  Json(request): Json<proto::RegisterVersionRequest>| async move {
                     let request = proto::RegisterVersionRequest { model, ..request };
-                    call(api, &headers, request, Api::register_version).await
+                    let auth = header_auth(&headers).map(str::to_string);
+                    api.register_version(auth, request).await.map(Json)
                 },
             )
             .get(
@@ -1077,6 +1287,18 @@ pub fn http_router(api: Api) -> axum::Router {
                  headers: HeaderMap,
                  Query(request): Query<proto::ListDriftAlertsRequest>| async move {
                     call(api, &headers, request, Api::list_drift_alerts).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/signature-compatibility",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path(model): Path<String>,
+                 Query(request): Query<proto::CheckSignatureCompatibilityRequest>| async move {
+                    let request = proto::CheckSignatureCompatibilityRequest { model, ..request };
+                    call(api, &headers, request, Api::check_signature_compatibility).await
                 },
             ),
         )

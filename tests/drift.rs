@@ -124,6 +124,15 @@ async fn drifted_summaries_alert_at_the_threshold_and_undrifted_ones_do_not() {
             artifact_digest: digest,
             framework: "lightgbm".into(),
             format: "onnx".into(),
+            signature: Some(hinagata::api::proto::Signature {
+                inputs: vec![hinagata::api::proto::TensorSpec {
+                    name: "features".into(),
+                    dtype: "float32".into(),
+                    shape: vec![-1, 4],
+                    nullable: false,
+                }],
+                outputs: vec![],
+            }),
             ..Default::default()
         }))
         .await
