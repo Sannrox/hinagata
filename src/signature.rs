@@ -37,7 +37,7 @@ fn onnx_dtype(elem_type: i32) -> Option<&'static str> {
 /// graph leaves open or a signature cannot express (an unknown rank, a
 /// sequence, an unknown element type) is `None`, with the reason in `why`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphValue {
+pub(crate) struct GraphValue {
     pub name: String,
     /// A plain tensor, which cannot be missing; only an optional type can.
     pub tensor: bool,
@@ -67,7 +67,7 @@ impl GraphValue {
 
 /// Errors from a graph past the reader's limits start with this, so a caller
 /// can tell them from a file that is not an ONNX model.
-pub const LIMIT_ERROR: &str = "the ONNX graph is past the reader's limits: ";
+pub(crate) const LIMIT_ERROR: &str = "the ONNX graph is past the reader's limits: ";
 
 /// Most graph inputs and outputs, weight initializers, and dimensions per
 /// tensor the reader accepts. A file past these is not read further, so a
@@ -206,7 +206,7 @@ fn read_value(bytes: &[u8]) -> Result<GraphValue, String> {
 /// The inputs (without weight initializers, which older exporters list as
 /// inputs) and outputs of an ONNX model's graph. `Err` when the bytes are
 /// not an ONNX model with a graph, or one past the reader's limits.
-pub fn read_graph(bytes: &[u8]) -> Result<(Vec<GraphValue>, Vec<GraphValue>), String> {
+pub(crate) fn read_graph(bytes: &[u8]) -> Result<(Vec<GraphValue>, Vec<GraphValue>), String> {
     let mut graph: Option<&[u8]> = None;
     each_field(bytes, |tag, wire| {
         if let (7, Wire::Bytes(field)) = (tag, wire) {
@@ -291,7 +291,7 @@ pub fn read_graph(bytes: &[u8]) -> Result<(Vec<GraphValue>, Vec<GraphValue>), St
 /// Check a declared signature against the graph: the same input and output
 /// names, and every type and shape the graph states equal. What the graph
 /// leaves open is taken as declared.
-pub fn verify_against_graph(
+pub(crate) fn verify_against_graph(
     declared: &Signature,
     graph: &(Vec<GraphValue>, Vec<GraphValue>),
 ) -> Result<(), String> {
@@ -349,7 +349,8 @@ pub fn verify_against_graph(
 }
 
 /// The signature an ONNX model declares, if the graph says all of it.
-pub fn from_onnx(bytes: &[u8]) -> Result<Signature, String> {
+#[cfg(test)]
+fn from_onnx(bytes: &[u8]) -> Result<Signature, String> {
     let (inputs, outputs) = read_graph(bytes)?;
     let specs = |values: Vec<GraphValue>| {
         values
@@ -412,7 +413,7 @@ fn widens(from: &str, to: &str) -> bool {
 }
 
 /// Every way `signature` does not fit `binding`; empty when it fits.
-pub fn check_binding(signature: &Signature, binding: &Binding) -> Vec<String> {
+pub(crate) fn check_binding(signature: &Signature, binding: &Binding) -> Vec<String> {
     let mut problems = Vec::new();
     if !matches!(binding.target_kind.as_str(), "dataset" | "object_type") {
         problems.push(format!(
@@ -493,7 +494,7 @@ pub fn check_binding(signature: &Signature, binding: &Binding) -> Vec<String> {
 /// an input that takes another type or shape or no longer accepts nulls, and
 /// a removed output, one of another type or shape, or one that may now be
 /// null.
-pub fn breaking_changes(old: &Signature, new: &Signature) -> Vec<String> {
+pub(crate) fn breaking_changes(old: &Signature, new: &Signature) -> Vec<String> {
     let find =
         |specs: &[TensorSpec], name: &str| specs.iter().find(|spec| spec.name == name).cloned();
     let mut breaking = Vec::new();

@@ -1709,7 +1709,7 @@ async fn call<Req: Send + 'static, Res: Send + 'static>(
 
 /// The HTTP/JSON routes. Bodies and query strings are the request messages
 /// in JSON; path segments fill the model and version.
-pub fn http_router(api: Api) -> axum::Router {
+fn http_router(api: Api) -> axum::Router {
     axum::Router::new()
         // Health and metrics answer without a credential: they report only
         // whether the server can work, and totals.

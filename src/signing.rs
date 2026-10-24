@@ -28,7 +28,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 /// Compact JSON with object keys sorted, as the format defines it.
-pub fn canonical(value: &impl Serialize) -> Result<String, String> {
+pub(crate) fn canonical(value: &impl Serialize) -> Result<String, String> {
     // `serde_json::Value` keeps object keys sorted, so going through it
     // sorts every level.
     let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
@@ -208,7 +208,7 @@ impl TrustedKeys {
 /// The version content in signed metadata bytes. Refused unless the bytes
 /// are exactly what [`metadata`] gives for that content, so nothing is
 /// admitted that the signature does not cover.
-pub fn parse_metadata(raw: &str) -> Result<crate::registry::NewVersion, String> {
+pub(crate) fn parse_metadata(raw: &str) -> Result<crate::registry::NewVersion, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Content {

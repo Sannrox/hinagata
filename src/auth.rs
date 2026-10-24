@@ -79,7 +79,7 @@ impl StaticToken {
     /// Constant-time match: both sides are fixed-length digests compared
     /// with `ct_eq`, so neither the token's content nor its length shows in
     /// the time taken.
-    pub fn matches(&self, presented: &str) -> bool {
+    fn matches(&self, presented: &str) -> bool {
         let presented: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
         presented.ct_eq(&self.digest).into()
     }
@@ -193,7 +193,7 @@ impl Authenticator for Jwt {
 
 /// The credential in an `authorization: Bearer <token>` header value. The
 /// scheme name is case-insensitive; the token is kept as sent.
-pub fn bearer(header: Option<&str>) -> Option<&str> {
+pub(crate) fn bearer(header: Option<&str>) -> Option<&str> {
     let (scheme, token) = header?.split_once(' ')?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
