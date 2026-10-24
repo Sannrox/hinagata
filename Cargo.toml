@@ -7,26 +7,27 @@ description = "Registry for classical ML models: versions, signatures, lineage, 
 publish = false
 
 [dependencies]
-axum = "0.8"
+# Compile-weight crates enable only the features this package calls.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
 bytes = "1.12.1"
 ed25519-dalek = "2.2.0"
-futures = "0.3.34"
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-object_store = { version = "0.14.2", features = ["aws"] }
-prost = "0.14"
-rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs"] }
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["float_roundtrip", "std"] }
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 url = "2"
-tokio-stream = { version = "0.1", features = ["net"] }
-tonic = { version = "0.14", features = ["tls-connect-info", "tls-ring"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "tls-connect-info", "tls-ring", "transport"] }
 tonic-prost = "0.14"
 
 [build-dependencies]
@@ -37,7 +38,7 @@ tonic-prost-build = "0.14"
 boon = "0.6.1"
 rcgen = "0.14"
 tempfile = "3.27.0"
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
 
 # Dependencies build without debug info in dev and test builds: backtraces
 # and debuggers keep full detail for workspace crates, and build directories
