@@ -227,7 +227,7 @@ fn shares(counts: &[u64]) -> Vec<f64> {
         .collect()
 }
 
-pub fn psi(expected: &[u64], actual: &[u64]) -> f64 {
+fn psi(expected: &[u64], actual: &[u64]) -> f64 {
     shares(expected)
         .into_iter()
         .zip(shares(actual))
@@ -236,7 +236,7 @@ pub fn psi(expected: &[u64], actual: &[u64]) -> f64 {
 }
 
 /// Largest gap of the cumulative distributions at the bin edges.
-pub fn binned_ks(expected: &[u64], actual: &[u64]) -> f64 {
+fn binned_ks(expected: &[u64], actual: &[u64]) -> f64 {
     let (te, ta) = (float_total(expected), float_total(actual));
     let (mut ce, mut ca, mut gap) = (0.0, 0.0, 0.0_f64);
     for (e, a) in expected.iter().zip(actual) {
@@ -251,7 +251,7 @@ pub fn binned_ks(expected: &[u64], actual: &[u64]) -> f64 {
 /// summary that does not use exactly the baseline's features, outputs and
 /// bins is refused. One with no observations in the window is skipped:
 /// there is nothing to compare, and an idle window is not drift.
-pub fn compare(baseline: &Baseline, summary: &Summary) -> Result<Vec<FeatureDrift>> {
+fn compare(baseline: &Baseline, summary: &Summary) -> Result<Vec<FeatureDrift>> {
     let mut drift = Vec::new();
     for (role, expected, actual) in [
         ("feature", &baseline.features, &summary.features),
