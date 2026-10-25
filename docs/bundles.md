@@ -10,9 +10,10 @@ A bundle is a directory, format `hinagata.bundle/v1`:
 | --- | --- |
 | `bundle.json` | `{"format": "hinagata.bundle/v1"}` |
 | `manifests/<model>-<version>.json` | the source's `GetVersionManifest` response: envelope fields and the metadata bytes |
+| `attestations/<model>-<version>.json` | the source's `GetPromotionAttestation` response, when the version has an approved promotion |
 | `artifacts/<hex>` | each artifact once, named by the lowercase hex of its SHA-256 |
 
-The manifests carry the signatures. `bundle.json` and the file names are not signed, and nothing depends on them beyond finding the files.
+The manifests carry the signatures. An attestation, when present, is signed separately and bound to the same artifact digest ([promotion](promotion.md)). `bundle.json` and the file names are not signed, and nothing depends on them beyond finding the files.
 
 ## Export
 
@@ -32,7 +33,7 @@ hinagata import --server https://registry-b:7700 --ca ca.pem --token-file token 
 
 Import changes nothing until every check passes:
 
-1. Locally, against `trusted.json`: each manifest's signature, its metadata digest, and the SHA-256 of its artifact file.
+1. Locally, against `trusted.json`: each manifest's signature, its metadata digest, the SHA-256 of its artifact file, and each attestation's signature and artifact digest when present.
 2. On the target, with `ImportVersion` and `validate_only`: each signature against the target's own `HINAGATA_TRUSTED_KEYS_FILE`, and the metadata, which must be exactly the canonical bytes the signature covers.
 3. Only then, for each version in source order (by model, then version), it creates the model if missing, uploads the artifact (resuming a partial upload), and calls `ImportVersion`. The target checks the signature and metadata again and, for ONNX, the signature against the graph. It then registers the version.
 

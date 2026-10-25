@@ -52,6 +52,35 @@ Changes between `candidate` and `staging`, and to `archived`, apply. Promotion t
 
 An applied change records `version.stage_changed`, and in the same transaction `version.stage_approved` with the request id, stages, approver, reference, reason and gate results. A deny records `version.stage_denied` with the same fields. `ListAuditEvents` returns them.
 
+## Attestation
+
+`GetPromotionAttestation` (`GET /v1/models/{model}/versions/{version}/promotion-attestation`) returns a signed proof that a version passed an approved stage change. Deployment descriptors carry no stage; this is how an offline deployer checks that the version was promoted. The registry must hold a signing key. The version must have a matching `version.stage_approved` record.
+
+An empty `stage` returns the latest production approval, or the latest approved stage change if the version was never promoted to production. A given `stage` returns that approved change.
+
+The response is `hinagata.signed-attestation/v1`:
+
+| Field | Value |
+| --- | --- |
+| `key_id` | the registry's signing key id |
+| `attestation` | compact JSON with keys sorted, exactly as signed |
+| `signature` | standard padded base64 of the Ed25519 signature over the UTF-8 bytes of `attestation` |
+
+The attestation is `hinagata.promotion-attestation/v1`:
+
+```json
+{"approver":"alice@governance","artifact_digest":"sha256:<hex>","format":"hinagata.promotion-attestation/v1","model":"churn","namespace":"tenant-a","reference":"CHG-1042","stage":"production","version":3}
+```
+
+It is bound to the artifact digest it covers. A verifier:
+
+1. refuses unless `format` is `hinagata.signed-attestation/v1` and `key_id` is trusted;
+2. verifies `signature` over the UTF-8 bytes of `attestation` with that key;
+3. parses `attestation` and refuses unless its `format` is `hinagata.promotion-attestation/v1`;
+4. compares the SHA-256 of the artifact with `artifact_digest`.
+
+`hinagata verify --keys <trusted keys> --attestation <file> --artifact <file>` does these steps. A tampered byte, or an attestation for version N used with version N+1's artifact, is refused. Export includes the attestation in a bundle when the version has one ([bundles](bundles.md)).
+
 ## Gates
 
 `PutPromotionGates` (`POST /v1/models/{model}/promotion-gates`) sets what a model requires before a version goes to production, audited as `model.promotion_gates_set`. `GetPromotionGates` reads them.

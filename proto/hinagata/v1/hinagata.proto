@@ -36,6 +36,12 @@ service Hinagata {
   // change applies.
   rpc PutPromotionGates(PutPromotionGatesRequest) returns (PromotionGates);
   rpc GetPromotionGates(GetPromotionGatesRequest) returns (PromotionGates);
+  // A signed promotion attestation: model, version, stage, approver,
+  // decision reference and artifact digest (docs/promotion.md). Exportable
+  // with a bundle and verifiable offline against trusted registry keys.
+  // FAILED_PRECONDITION without a signing key, or when the version has no
+  // matching approved stage change.
+  rpc GetPromotionAttestation(GetPromotionAttestationRequest) returns (SignedAttestation);
 
   // The changes from one version's signature to another's that break a
   // caller of the first: a new input, an input of another type or shape or
@@ -572,6 +578,24 @@ message PutPromotionGatesRequest {
 
 message GetPromotionGatesRequest {
   string model = 1;
+}
+
+message GetPromotionAttestationRequest {
+  string model = 1;
+  uint64 version = 2;
+  // Empty: the latest production approval, or the latest approved stage
+  // change if the version was never promoted to production.
+  string stage = 3;
+}
+
+// `hinagata.signed-attestation/v1`.
+message SignedAttestation {
+  string format = 1;
+  string key_id = 2;
+  // The attestation: canonical JSON, exactly as signed.
+  string attestation = 3;
+  // Base64 of the Ed25519 signature over `attestation`.
+  string signature = 4;
 }
 
 message ImportVersionRequest {
