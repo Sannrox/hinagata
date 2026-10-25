@@ -631,6 +631,40 @@ impl Api {
         })
     }
 
+    pub fn get_promotion_attestation(
+        &self,
+        authorization: Option<&str>,
+        request: proto::GetPromotionAttestationRequest,
+    ) -> Result<proto::SignedAttestation, ApiError> {
+        let identity = self.identity(authorization)?;
+        let signer = self.signer.as_ref().ok_or_else(|| {
+            ApiError::from(RegistryError::Refused(
+                "this registry has no signing key, so it signs no attestations".into(),
+            ))
+        })?;
+        let stage = match request.stage.as_str() {
+            "" => None,
+            value => Some(Stage::parse(value)?),
+        };
+        let version =
+            self.registry
+                .get_version(identity.namespace(), &request.model, request.version)?;
+        let approval = self.registry.promotion_approval(
+            identity.namespace(),
+            &request.model,
+            request.version,
+            stage,
+        )?;
+        let signed = crate::attestation::sign(signer, identity.namespace(), &version, &approval)
+            .map_err(RegistryError::Storage)?;
+        Ok(proto::SignedAttestation {
+            format: signed.format,
+            key_id: signed.key_id,
+            attestation: signed.attestation,
+            signature: signed.signature,
+        })
+    }
+
     /// Open or resume an upload. A stored artifact whose bytes no longer
     /// verify is reopened, so its namespace can send them again.
     pub async fn begin_artifact_upload(
@@ -1610,6 +1644,7 @@ grpc_methods! {
     get_promotion_gates(GetPromotionGatesRequest) -> PromotionGates;
     check_signature_compatibility(CheckSignatureCompatibilityRequest) -> CheckSignatureCompatibilityResponse;
     get_version_manifest(GetVersionManifestRequest) -> VersionManifest;
+    get_promotion_attestation(GetPromotionAttestationRequest) -> SignedAttestation;
     get_online_descriptor(GetOnlineDescriptorRequest) -> SignedDescriptor;
     get_batch_descriptor(GetBatchDescriptorRequest) -> SignedDescriptor;
     list_audit_events(ListAuditEventsRequest) -> ListAuditEventsResponse;
@@ -1983,6 +2018,22 @@ fn http_router(api: Api) -> axum::Router {
                  Path((model, version)): Path<(String, u64)>| async move {
                     let request = proto::GetVersionManifestRequest { model, version };
                     call(api, &headers, request, Api::get_version_manifest).await
+                },
+            ),
+        )
+        .route(
+            "/v1/models/{model}/versions/{version}/promotion-attestation",
+            get(
+                |State(api): State<Api>,
+                 headers: HeaderMap,
+                 Path((model, version)): Path<(String, u64)>,
+                 Query(request): Query<proto::GetPromotionAttestationRequest>| async move {
+                    let request = proto::GetPromotionAttestationRequest {
+                        model,
+                        version,
+                        ..request
+                    };
+                    call(api, &headers, request, Api::get_promotion_attestation).await
                 },
             ),
         )

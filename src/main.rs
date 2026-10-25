@@ -5,6 +5,8 @@
 //! [--artifact <file>] [--metadata <file>]` checks a signed version
 //! manifest offline, with only the trusted public keys. The envelope file is
 //! the `GetVersionManifest` response as JSON; its `metadata` is checked too.
+//! `--attestation <file>` instead checks a signed promotion attestation
+//! (`GetPromotionAttestation`); `--artifact` is required then.
 //!
 //! `hinagata export --server <url> --token-file <file> [--ca <pem>] --model
 //! <model> --version <n>... --out <dir>` writes a signed bundle, and
@@ -108,15 +110,43 @@ fn one<'a>(
 fn verify(args: &[String]) -> Result<String, String> {
     let flags = flags(
         args,
-        &["--keys", "--envelope", "--artifact", "--metadata"],
+        &[
+            "--keys",
+            "--envelope",
+            "--artifact",
+            "--metadata",
+            "--attestation",
+        ],
         &[],
     )?;
     let read = |path: &str| std::fs::read(path).map_err(|error| format!("{path}: {error}"));
     let keys = one(&flags, "--keys").ok_or("verify needs --keys <trusted keys file>")?;
-    let envelope = one(&flags, "--envelope").ok_or("verify needs --envelope <manifest file>")?;
     let keys = hinagata::signing::TrustedKeys::from_json(
         &String::from_utf8(read(keys)?).map_err(|_| "the keys file is not UTF-8")?,
     )?;
+    if let Some(path) = one(&flags, "--attestation") {
+        if one(&flags, "--envelope").is_some() || one(&flags, "--metadata").is_some() {
+            return Err("verify --attestation cannot be used with --envelope or --metadata".into());
+        }
+        let artifact =
+            read(one(&flags, "--artifact").ok_or("verify --attestation needs --artifact <file>")?)?;
+        let signed: hinagata::attestation::Signed = serde_json::from_slice(&read(path)?)
+            .map_err(|error| format!("attestation: {error}"))?;
+        let attestation = hinagata::attestation::verify(&keys, &signed)?;
+        hinagata::attestation::check_artifact(&attestation, &artifact)?;
+        return Ok(format!(
+            "verified {} version {} of `{}` in `{}` as {}, approved by `{}` (`{}`), signed by `{}`",
+            attestation.artifact_digest,
+            attestation.version,
+            attestation.model,
+            attestation.namespace,
+            attestation.stage,
+            attestation.approver,
+            attestation.reference,
+            signed.key_id
+        ));
+    }
+    let envelope = one(&flags, "--envelope").ok_or("verify needs --envelope <manifest file>")?;
     let raw = read(envelope)?;
     let envelope: hinagata::signing::Envelope =
         serde_json::from_slice(&raw).map_err(|error| format!("envelope: {error}"))?;

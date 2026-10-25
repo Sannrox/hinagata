@@ -179,23 +179,45 @@ impl TrustedKeys {
         Ok(Self { keys })
     }
 
+    /// Check that a trusted key signed exactly `bytes`. An unknown key is
+    /// refused, not skipped.
+    pub fn verify_signature(
+        &self,
+        key_id: &str,
+        bytes: &[u8],
+        signature: &str,
+    ) -> Result<(), String> {
+        let key = self
+            .keys
+            .get(key_id)
+            .ok_or_else(|| format!("key `{key_id}` is not trusted"))?;
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .ok()
+            .and_then(|bytes| ed25519_dalek::Signature::from_slice(&bytes).ok())
+            .ok_or("the signature is not a 64-byte Ed25519 signature")?;
+        key.verify(bytes, &signature)
+            .map_err(|_| "the signature does not match".to_string())
+    }
+
     /// Check an envelope: a trusted key signed exactly these manifest bytes.
     /// Returns the manifest. An unknown key is refused, not skipped.
     pub fn verify(&self, envelope: &Envelope) -> Result<Manifest, String> {
         if envelope.format != ENVELOPE_FORMAT {
             return Err(format!("envelope format must be {ENVELOPE_FORMAT}"));
         }
-        let key = self
-            .keys
-            .get(&envelope.key_id)
-            .ok_or_else(|| format!("key `{}` is not trusted", envelope.key_id))?;
-        let signature = base64::engine::general_purpose::STANDARD
-            .decode(&envelope.signature)
-            .ok()
-            .and_then(|bytes| ed25519_dalek::Signature::from_slice(&bytes).ok())
-            .ok_or("the signature is not a 64-byte Ed25519 signature")?;
-        key.verify(envelope.manifest.as_bytes(), &signature)
-            .map_err(|_| "the signature does not match the manifest".to_string())?;
+        self.verify_signature(
+            &envelope.key_id,
+            envelope.manifest.as_bytes(),
+            &envelope.signature,
+        )
+        .map_err(|error| {
+            if error == "the signature does not match" {
+                "the signature does not match the manifest".into()
+            } else {
+                error
+            }
+        })?;
         let manifest: Manifest = serde_json::from_str(&envelope.manifest)
             .map_err(|error| format!("manifest: {error}"))?;
         if manifest.format != MANIFEST_FORMAT {

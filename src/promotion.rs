@@ -72,6 +72,14 @@ pub struct Pending {
     pub gates: Vec<GateResult>,
 }
 
+/// An approved stage change, as recorded in the audit trail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    pub stage: Stage,
+    pub approver: String,
+    pub reference: String,
+}
+
 /// What the audit trail records for a decided stage change.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Recorded<'a> {
@@ -390,6 +398,64 @@ impl Registry {
         })
     }
 
+    /// The approval a signed attestation covers: `stage` when set, else the
+    /// latest production approval, else the latest approved stage change.
+    pub fn promotion_approval(
+        &self,
+        namespace: &str,
+        model: &str,
+        version: u64,
+        stage: Option<Stage>,
+    ) -> Result<Approval> {
+        crate::registry::check_number("version", version)?;
+        self.read(|conn| {
+            crate::registry::load_version(conn, namespace, model, version)?;
+            let mut statement = conn.prepare(
+                "SELECT after FROM audit_events
+                 WHERE namespace = ?1 AND model = ?2 AND version = ?3
+                   AND action = 'version.stage_approved'
+                 ORDER BY seq DESC",
+            )?;
+            let rows = statement.query_map(params![namespace, model, version], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut latest = None;
+            let mut production = None;
+            let mut matching = None;
+            for row in rows {
+                let recorded: ApprovalRecord = serde_json::from_str(&row?).map_err(storage)?;
+                let approved_stage = Stage::parse(&recorded.to_stage)?;
+                let approval = Approval {
+                    stage: approved_stage,
+                    approver: recorded.approver,
+                    reference: recorded.reference,
+                };
+                if latest.is_none() {
+                    latest = Some(approval.clone());
+                }
+                if approved_stage == Stage::Production && production.is_none() {
+                    production = Some(approval.clone());
+                }
+                if stage == Some(approved_stage) && matching.is_none() {
+                    matching = Some(approval);
+                }
+            }
+            match stage {
+                Some(stage) => matching.ok_or_else(|| {
+                    RegistryError::Refused(format!(
+                        "version {version} of `{model}` has no approved promotion to {}",
+                        stage.as_str()
+                    ))
+                }),
+                None => production.or(latest).ok_or_else(|| {
+                    RegistryError::Refused(format!(
+                        "version {version} of `{model}` has no approved promotion"
+                    ))
+                }),
+            }
+        })
+    }
+
     /// Record a denied stage change, audited as `version.stage_denied`.
     pub fn record_stage_denial(
         &self,
@@ -411,6 +477,13 @@ impl Registry {
             )
         })
     }
+}
+
+#[derive(Deserialize)]
+struct ApprovalRecord {
+    to_stage: String,
+    approver: String,
+    reference: String,
 }
 
 fn recorded<'a>(

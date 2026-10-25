@@ -30,7 +30,7 @@ Models and versions live in the caller's namespace, in one embedded database fil
 
 ## Signed manifests
 
-With `HINAGATA_SIGNING_KEY_FILE` (an Ed25519 seed as 64 hex characters) and `HINAGATA_SIGNING_KEY_ID`, `GetVersionManifest` returns a version's metadata and a detached signature over its manifest: namespace, model, version number, artifact digest and metadata digest. Anyone holding the public key can check, offline, that an artifact and its metadata came from this registry: `hinagata verify --keys trusted.json --envelope manifest.json --artifact model.onnx`. The format is in [docs/signatures.md](docs/signatures.md), so other verifiers need no Hinagata code. Without a key the call is refused.
+With `HINAGATA_SIGNING_KEY_FILE` (an Ed25519 seed as 64 hex characters) and `HINAGATA_SIGNING_KEY_ID`, `GetVersionManifest` returns a version's metadata and a detached signature over its manifest: namespace, model, version number, artifact digest and metadata digest. Anyone holding the public key can check, offline, that an artifact and its metadata came from this registry: `hinagata verify --keys trusted.json --envelope manifest.json --artifact model.onnx`. The format is in [docs/signatures.md](docs/signatures.md), so other verifiers need no Hinagata code. Without a key the call is refused. After an approved stage change, `GetPromotionAttestation` returns a signed attestation bound to the same artifact digest (approver, decision reference, stage): `hinagata verify --keys trusted.json --attestation attestation.json --artifact model.onnx` ([promotion](docs/promotion.md)).
 
 ## Deployment descriptors
 
@@ -67,6 +67,7 @@ Hinagata stores no predictions or labels. The caller joins labels to its own pre
 | `POST /v1/models/{model}/versions`, `GET /v1/models/{model}/versions` | `RegisterVersion`, `ListVersions` |
 | `GET /v1/models/{model}/versions/{version}` | `GetVersion` |
 | `GET /v1/models/{model}/versions/{version}/manifest` | `GetVersionManifest` |
+| `GET /v1/models/{model}/versions/{version}/promotion-attestation` | `GetPromotionAttestation` |
 | `POST /v1/models/{model}/versions/{version}/online-descriptor`, `.../batch-descriptor` | `GetOnlineDescriptor`, `GetBatchDescriptor` |
 | gRPC only | `ImportVersion` |
 | `GET /v1/models/{model}/signature-compatibility?from_version=…&to_version=…` | `CheckSignatureCompatibility` |

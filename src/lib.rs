@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod artifacts;
+pub mod attestation;
 pub mod auth;
 pub mod bundle;
 pub mod config;

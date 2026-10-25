@@ -6,19 +6,23 @@
 //! - `manifests/<model>-<version>.json`: the source registry's
 //!   `GetVersionManifest` response, which signs the artifact digest and the
 //!   metadata.
+//! - `attestations/<model>-<version>.json`: the source's
+//!   `GetPromotionAttestation` response, when the version has an approved
+//!   promotion.
 //! - `artifacts/<hex>`: each artifact, named by its SHA-256.
 //!
 //! [`export`] reads versions from a registry over gRPC. [`verify`] checks a
 //! bundle offline against trusted keys: every signature, every metadata
-//! digest and every artifact digest. [`import`] verifies first, asks the
+//! digest, every artifact digest, and each promotion attestation when
+//! present. [`import`] verifies first, asks the
 //! target to validate every manifest, and only then uploads artifacts and
 //! imports versions, so a bundle that fails any check changes nothing.
 
 use crate::api::proto::hinagata_client::HinagataClient;
 use crate::api::proto::{
     BeginArtifactUploadRequest, CompleteArtifactUploadRequest, CreateModelRequest,
-    GetVersionManifestRequest, ImportVersionRequest, ReadArtifactRequest,
-    UploadArtifactChunkRequest, VersionManifest,
+    GetPromotionAttestationRequest, GetVersionManifestRequest, ImportVersionRequest,
+    ReadArtifactRequest, SignedAttestation, UploadArtifactChunkRequest, VersionManifest,
 };
 use crate::signing::{Envelope, Manifest, TrustedKeys};
 use sha2::{Digest, Sha256};
@@ -146,6 +150,28 @@ pub async fn export(
             .join(format!("{model}-{version}.json"));
         let body = serde_json::to_vec_pretty(&bundled).map_err(|error| error.to_string())?;
         std::fs::write(&path, body).map_err(io(&path))?;
+        let request = client.request(GetPromotionAttestationRequest {
+            model: model.into(),
+            version,
+            stage: String::new(),
+        })?;
+        match client.inner.get_promotion_attestation(request).await {
+            Ok(response) => {
+                std::fs::create_dir_all(dir.join("attestations")).map_err(io(dir))?;
+                let path = dir
+                    .join("attestations")
+                    .join(format!("{model}-{version}.json"));
+                let body = serde_json::to_vec_pretty(&response.into_inner())
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(&path, body).map_err(io(&path))?;
+            }
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::Unimplemented
+                ) => {}
+            Err(error) => return Err(status(error)),
+        }
         written.push(format!("{model} version {version}"));
     }
     let marker = dir.join("bundle.json");
@@ -214,6 +240,12 @@ pub fn verify(keys: &TrustedKeys, dir: &Path) -> Result<Vec<Entry>, String> {
                 artifact.display()
             ));
         }
+        let attestation = dir
+            .join("attestations")
+            .join(format!("{}-{}.json", manifest.model, manifest.version));
+        if attestation.exists() {
+            verify_attestation(keys, &attestation, &manifest)?;
+        }
         entries.push(Entry {
             bundled,
             manifest,
@@ -223,7 +255,62 @@ pub fn verify(keys: &TrustedKeys, dir: &Path) -> Result<Vec<Entry>, String> {
     entries.sort_by(|a, b| {
         (&a.manifest.model, a.manifest.version).cmp(&(&b.manifest.model, b.manifest.version))
     });
+    let attestations = dir.join("attestations");
+    if attestations.is_dir() {
+        for file in std::fs::read_dir(&attestations).map_err(io(&attestations))? {
+            let path = file.map_err(io(&attestations))?.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let known = entries.iter().any(|entry| {
+                name == format!("{}-{}.json", entry.manifest.model, entry.manifest.version)
+            });
+            if !known {
+                return Err(format!(
+                    "{}: attestation does not belong to a bundled version",
+                    path.display()
+                ));
+            }
+        }
+    }
     Ok(entries)
+}
+
+fn verify_attestation(keys: &TrustedKeys, path: &Path, manifest: &Manifest) -> Result<(), String> {
+    let raw = std::fs::read(path).map_err(io(path))?;
+    let bundled: SignedAttestation =
+        serde_json::from_slice(&raw).map_err(|error| format!("{}: {error}", path.display()))?;
+    let signed = crate::attestation::Signed {
+        format: bundled.format,
+        key_id: bundled.key_id,
+        attestation: bundled.attestation,
+        signature: bundled.signature,
+    };
+    let attestation = crate::attestation::verify(keys, &signed)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if attestation.namespace != manifest.namespace
+        || attestation.model != manifest.model
+        || attestation.version != manifest.version
+    {
+        return Err(format!(
+            "{}: attestation is for {} `{}` version {}, not {} `{}` version {}",
+            path.display(),
+            attestation.namespace,
+            attestation.model,
+            attestation.version,
+            manifest.namespace,
+            manifest.model,
+            manifest.version
+        ));
+    }
+    if attestation.artifact_digest != manifest.artifact_digest {
+        return Err(format!(
+            "{}: attestation names another artifact",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Verify the bundle at `dir`, have the target validate every manifest,
