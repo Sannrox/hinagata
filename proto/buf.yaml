@@ -1,0 +1,11 @@
+# buf configuration for hinagata's proto surface. CI runs `buf breaking`
+# against the last final v* tag (see the Proto breaking job). FILE is the
+# strictest category: renames and moves break the generated Rust code, not
+# only the wire. onnx/ mirrors field numbers from the published ONNX schema
+# to decode model files; it is not hinagata's contract.
+version: v2
+breaking:
+  use:
+    - FILE
+  ignore:
+    - onnx
