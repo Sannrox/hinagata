@@ -2016,45 +2016,66 @@ mod tests {
         assert!(Lineage::from_run_receipt("{", &digest('4')).is_err());
     }
 
+    /// Every earlier schema, including N-1 (what the previous release
+    /// wrote), opens with its data and migrates forward; a newer schema is
+    /// refused.
     #[test]
-    fn a_database_from_an_older_schema_opens_and_a_newer_one_is_refused() {
-        let path = std::env::temp_dir().join(format!(
-            "hinagata-registry-{}-{:?}.db",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        // A database written at schema 1, before lineage, with a version.
-        let mut conn = Connection::open(&path).unwrap();
-        let tx = conn.transaction().unwrap();
-        tx.execute_batch(MIGRATIONS[0]).unwrap();
-        tx.pragma_update(None, "user_version", 1).unwrap();
-        tx.execute_batch(&format!(
-            "INSERT INTO models VALUES ('a', 'churn', '', 1, 'svc');
-             INSERT INTO versions VALUES ('a', 'churn', 1, '{DIGEST}', 'xgboost', 'onnx',
-                 '{{\"inputs\":[],\"outputs\":[]}}', '{{}}', '{{}}', 'candidate', 1, 'svc');"
-        ))
-        .unwrap();
-        tx.commit().unwrap();
-        drop(conn);
-        let registry = Registry::open(&path).unwrap();
-        let old = registry.get_version("a", "churn", 1).unwrap();
-        assert_eq!(old.lineage, Lineage::default());
-        drop(registry);
-        // Reopening keeps the data and the schema.
-        let registry = Registry::open(&path).unwrap();
-        assert_eq!(registry.get_model("a", "churn").unwrap().name, "churn");
-        drop(registry);
-        let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", MIGRATIONS.len() + 1)
+    fn databases_from_every_earlier_schema_open_and_a_newer_one_is_refused() {
+        for schema in 1..MIGRATIONS.len() {
+            let path = std::env::temp_dir().join(format!(
+                "hinagata-registry-{}-{:?}-schema{schema}.db",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            // A database a release at `schema` wrote, with one version. Named
+            // columns are the schema-1 set; later migrations add defaults.
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..schema] {
+                tx.execute_batch(migration).unwrap();
+            }
+            tx.pragma_update(None, "user_version", schema).unwrap();
+            tx.execute_batch(&format!(
+                "INSERT INTO models (namespace, name, description, created_at_ms, created_by)
+                     VALUES ('a', 'churn', '', 1, 'svc');
+                 INSERT INTO versions (namespace, model, version, artifact_digest, framework,
+                     format, signature, metrics, tags, stage, created_at_ms, created_by)
+                     VALUES ('a', 'churn', 1, '{DIGEST}', 'xgboost', 'onnx',
+                     '{{\"inputs\":[],\"outputs\":[]}}', '{{}}', '{{}}', 'candidate', 1, 'svc');"
+            ))
             .unwrap();
-        drop(conn);
-        let Err(error) = Registry::open(&path) else {
-            panic!("a newer schema opened");
-        };
-        assert!(error.to_string().contains("newer"), "{error}");
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            tx.commit().unwrap();
+            drop(conn);
+
+            let registry = Registry::open(&path).unwrap();
+            let old = registry.get_version("a", "churn", 1).unwrap();
+            assert_eq!(old.lineage, Lineage::default(), "schema {schema}");
+            drop(registry);
+            // Reopening keeps the data and the migrated schema.
+            let registry = Registry::open(&path).unwrap();
+            assert_eq!(
+                registry.get_model("a", "churn").unwrap().name,
+                "churn",
+                "schema {schema}"
+            );
+            drop(registry);
+            let conn = Connection::open(&path).unwrap();
+            let migrated: usize = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(migrated, MIGRATIONS.len(), "schema {schema}");
+
+            conn.pragma_update(None, "user_version", MIGRATIONS.len() + 1)
+                .unwrap();
+            drop(conn);
+            let Err(error) = Registry::open(&path) else {
+                panic!("a newer schema opened");
+            };
+            assert!(error.to_string().contains("newer"), "{error}");
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
         }
     }
 }
