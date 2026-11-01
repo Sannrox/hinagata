@@ -221,6 +221,11 @@ implications. Do not put hostnames, FQDNs, home directories, absolute worktree
 paths, LAN or employer network names, or other private environment inventory on
 public Issues, Pull Requests, comments, or commit messages. Release notes
 belong in the pull request body; [CHANGELOG.md](CHANGELOG.md) is release-owned.
+When callers must act, mark the title `type!:` or add a `## Breaking` or
+`## Upgrade` section, and add the `risk:breaking` label. The CI
+`Proto breaking` job runs `buf breaking` (rules in `proto/buf.yaml`) against
+the last final `v*` tag, once one exists; a reported break passes only with
+that marker and label.
 
 ### Verified commits on GitHub
 

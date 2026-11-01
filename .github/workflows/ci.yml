@@ -120,3 +120,65 @@ jobs:
           fetch-tags: true
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: bash scripts/validate-release.sh
+
+  # Proto compatibility against the last final v* tag (proto/buf.yaml sets the
+  # rules). A reported break passes only when the pull request is marked
+  # breaking (`type!:` subject or a Breaking/Upgrade section, see
+  # AGENTS.md) and labelled `risk:breaking`; a tool failure stays red.
+  proto-breaking:
+    name: Proto breaking
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
+        with:
+          version: 1.75.0
+          setup_only: true
+      - name: buf breaking
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          tag="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "$BASE" 2>/dev/null || true)"
+          if [[ -z "$tag" ]]; then
+            echo "::notice::No final v* tag yet; nothing to compare against."
+            exit 0
+          fi
+          if ! git cat-file -e "${tag}:proto" 2>/dev/null; then
+            echo "::notice::${tag} has no proto/ directory; nothing to compare against."
+            exit 0
+          fi
+          rc=0
+          out="$(buf breaking proto --against ".git#tag=${tag},subdir=proto" --error-format github-actions 2>&1)" || rc=$?
+          echo "$out"
+          [[ $rc -eq 0 ]] && exit 0
+          # buf exits 100 for reported incompatibilities; anything else is a tool error.
+          if [[ $rc -ne 100 ]]; then
+            echo "::error::buf breaking failed without reporting a break (exit ${rc}); see the log."
+            exit "$rc"
+          fi
+          # Read the live title, body, and labels so an edit plus a re-run is enough.
+          pr="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json title,body,labels)"
+          title="$(jq -r .title <<<"$pr")"
+          body="$(jq -r .body <<<"$pr")"
+          bang='^[a-z]+(\([^)]*\))?!:'
+          marked=false
+          if [[ "$title" =~ $bang ]] || grep -qE '^(BREAKING[ -]CHANGE|#+ *(Breaking|Upgrade))' <<<"$body"; then
+            marked=true
+          fi
+          labelled="$(jq '[.labels[].name] | index("risk:breaking") != null' <<<"$pr")"
+          if [[ "$marked" == true && "$labelled" == true ]]; then
+            echo "::notice::Proto break against ${tag} accepted: the pull request is marked breaking and labelled risk:breaking."
+            exit 0
+          fi
+          echo "::error::buf breaking found incompatible proto changes against ${tag}. Mark the pull request breaking (a 'type!:' title or a '## Breaking' section) and add the risk:breaking label, or keep the change compatible."
+          exit 1
