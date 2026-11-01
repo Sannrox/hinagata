@@ -6,6 +6,23 @@ Family versioning, tagging, and release policy:
 This page is hinagata-local: how a maintainer prepares and tags **this**
 repository.
 
+## Compatibility of configuration, CLI and file formats
+
+- **Configuration.** The server is configured by `HINAGATA_*` environment
+  variables. A variable is renamed or removed only after one minor release
+  that still honours it and logs a deprecation warning naming its
+  replacement; a setting never changes meaning under the same name.
+- **Versioned files.** The trusted keys file may declare `"version": 1`;
+  omitted means the current version and any other value is refused. Export
+  bundles carry `bundle.json` `{"format": "hinagata.bundle/v1"}` and an
+  unknown format is refused. A change older readers cannot handle gets a
+  new version or format id.
+- **CLI.** The `verify`, `export` and `import` subcommands and their flags
+  are removed only after one minor release that still accepts them and
+  prints a deprecation warning naming the replacement. Their output is
+  human-readable text, not a stable API; a JSON mode, if added, is
+  versioned like an API.
+
 ## Who cuts a tag
 
 Agents never push `v*` tags. After the version-bump pull request merges, the
