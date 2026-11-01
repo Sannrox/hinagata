@@ -147,8 +147,13 @@ impl Signer {
     }
 }
 
+/// The trusted keys file schema this release reads.
+pub const TRUSTED_KEYS_VERSION: u32 = 1;
+
 /// Public keys a verifier trusts, by key id: a JSON file
-/// `{"keys": [{"key_id": "...", "public_key": "<64 hex>"}]}`.
+/// `{"version": 1, "keys": [{"key_id": "...", "public_key": "<64 hex>"}]}`.
+/// `version` is optional (omitted means [`TRUSTED_KEYS_VERSION`]); any other
+/// value is refused, so a newer file never loads with fields ignored.
 #[derive(Debug, Clone, Default)]
 pub struct TrustedKeys {
     keys: BTreeMap<String, VerifyingKey>,
@@ -158,6 +163,8 @@ impl TrustedKeys {
     pub fn from_json(text: &str) -> Result<Self, String> {
         #[derive(Deserialize)]
         struct File {
+            #[serde(default)]
+            version: Option<u32>,
             keys: Vec<Entry>,
         }
         #[derive(Deserialize)]
@@ -167,6 +174,11 @@ impl TrustedKeys {
         }
         let file: File =
             serde_json::from_str(text).map_err(|error| format!("trusted keys: {error}"))?;
+        if let Some(version) = file.version.filter(|v| *v != TRUSTED_KEYS_VERSION) {
+            return Err(format!(
+                "trusted keys file version {version} is not supported; this release reads version {TRUSTED_KEYS_VERSION}"
+            ));
+        }
         let mut keys = BTreeMap::new();
         for entry in file.keys {
             let bytes = parse_hex32(&format!("public key `{}`", entry.key_id), &entry.public_key)?;
@@ -385,5 +397,21 @@ mod tests {
                 .unwrap_err()
                 .contains("twice")
         );
+    }
+
+    #[test]
+    fn trusted_keys_version_defaults_to_current_and_unknown_versions_are_refused() {
+        let key = "00".repeat(32);
+        for accepted in ["", r#""version": 1,"#] {
+            let text = format!(r#"{{{accepted} "keys": []}}"#);
+            TrustedKeys::from_json(&text).unwrap_or_else(|error| panic!("{accepted:?}: {error}"));
+        }
+        for refused in [2, 0] {
+            let text = format!(
+                r#"{{"version": {refused}, "keys": [{{"key_id": "k", "public_key": "{key}"}}]}}"#
+            );
+            let error = TrustedKeys::from_json(&text).unwrap_err();
+            assert!(error.contains("is not supported"), "{refused}: {error}");
+        }
     }
 }
