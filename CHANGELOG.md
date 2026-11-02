@@ -10,8 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.0]
+## [0.1.0] - 2026-11-02
 
-Development crate version. No git tag yet. The crate is not on crates.io
-(`publish = false`). `Dockerfile` builds the release image from the static
-binary; deploy by digest, never by a `latest` tag.
+First release.
+
+### Added
+
+- Namespaced model and immutable version registration with schema, artifact signatures, metrics and training lineage.
+- Caller-governed promotion, signed deployment descriptors and offline manifest verification.
+- Prediction summaries, drift and quality monitoring, alerts and audit events.
+- Authenticated HTTP and gRPC interfaces, configurable TLS, local or object-store artifacts, and operational diagnostics.
+
+### Upgrade
+
+- Initial tagged release; no earlier tagged storage or API baseline exists.
+- Configure caller authentication and namespace admission before serving requests. Promotion retains its configured approval requirements.
+- The embedded store and its backup belong to the registry. Preserve a backup before changing binaries; artifact storage does not replace that backup.
