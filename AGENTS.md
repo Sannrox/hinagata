@@ -27,9 +27,11 @@ image).
   `bash scripts/validate-release.sh`. CI also runs
   `cargo deny check licenses`, the S3-compatible artifact store job, and the
   static image.
-- `scripts/validate-release.sh` checks the tag-triggered release path: signed
-  annotated tags, CHANGELOG notes, SBOM, and the family release manifest.
-  Pull requests and dry runs must not publish or attest.
+- `scripts/validate-release.sh` checks the release path: a `v*` tag push only
+  dispatches `release.yml` on `main`, which verifies the signed annotated tag
+  and builds the tagged commit; it also checks CHANGELOG notes, SBOM, and the
+  family release manifest. Pull requests and dry runs must not publish or
+  attest. See [RELEASING.md](RELEASING.md).
 
 GitHub Issues are the planning source of truth. Workflow Skills are shared;
 see `## Shared agent skills`. Never commit hostnames, home paths, secrets or
@@ -330,5 +332,6 @@ the local gates (`make update`, `make validate`, `make test`,
 - configuration additions, removals, defaults, and README;
 - security, rollback, and operator actions;
 - static image packaging (`Dockerfile`; deploy by digest, never a `latest` tag);
-- release notes drafted from the pull request bodies since the last tag with
-  `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the release.
+- release notes drafted from the pull request bodies since the last final
+  tag with `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the
+  release.
