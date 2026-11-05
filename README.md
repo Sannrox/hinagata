@@ -1,13 +1,102 @@
 # Hinagata
 
-Hinagata is a standalone registry for classical machine learning models, written in Rust.
+**Know which model is in production, where it came from, what it expects, and whether it still behaves.**
 
-- Registers models and immutable, content-addressed model versions with their input and output schema, metrics and lineage (training dataset version, code reference, run receipt).
-- Promotes versions through stages with an approval hook that the caller governs.
-- Produces signed deployment descriptors: the deployer runs online scoring services, and the batch runner runs scoring jobs.
-- Monitors deployed versions: prediction statistics, data drift and, once labels arrive, model quality, with alerts.
+[![CI](https://img.shields.io/github/actions/workflow/status/Sannrox/hinagata/ci.yml?branch=main&label=ci)](https://github.com/Sannrox/hinagata/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Sannrox/hinagata)](https://github.com/Sannrox/hinagata/releases)
+[![License](https://img.shields.io/github/license/Sannrox/hinagata)](LICENSE)
 
-Hinagata doesn't make governance decisions. A caller in front of it enforces policy. It stores artifacts on local disk or S3-compatible object storage, and runs as a single binary. Beyond an S3-compatible store, its only outbound call is the optional approval hook.
+[Try it](#try-it) · [How it works](#how-it-works) · [API](#api) · [Vision](VISION.md) · [Decisions](docs/decisions/README.md)
+
+> Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues
+> for planned work.
+
+Hinagata (雛形, "model" or "pattern") is a standalone registry for classical
+machine learning models — gradient-boosted trees, linear models, small neural
+networks exported to ONNX — written in Rust. It records models and immutable
+versions with typed signatures and lineage, promotes them through stages under
+an approval hook the caller governs, produces signed deployment descriptors,
+and monitors deployed versions for data drift and model quality. Hinagata
+doesn't make governance decisions; a caller in front of it enforces policy.
+
+- **Immutable, content-addressed versions.** A version pins its artifact by
+  SHA-256 digest and never changes once registered.
+- **Typed signatures, checked at registration.** Every version declares its
+  input and output schema, read from the ONNX graph when omitted and
+  optionally bound to a dataset schema or an object type.
+- **Lineage fixed at registration.** Each version records its training
+  dataset versions, code reference, parameters and run receipt, and the
+  registry answers the reverse question: which versions were trained on a
+  dataset.
+- **Caller-governed promotion.** Stage changes go through an approval hook,
+  promotion to production is refused without one, and a model can require
+  gates: metric minimums, signature compatibility, a signed manifest.
+- **Signed and verifiable offline.** Manifests, deployment descriptors and
+  transfer bundles carry detached Ed25519 signatures that anyone holding the
+  public key checks without Hinagata code.
+- **One binary, few moving parts.** An embedded database, artifacts on local
+  disk or S3-compatible object storage, and no outbound call beyond storage
+  and the optional approval hook.
+
+## Try it
+
+From a fresh clone, with a recent Rust toolchain. Start the registry with a
+static development credential:
+
+```bash
+git clone https://github.com/Sannrox/hinagata && cd hinagata
+printf 'dev-token' > token.txt
+HINAGATA_STATIC_TOKEN_FILE=token.txt HINAGATA_STATIC_NAMESPACE=dev cargo run --locked
+```
+
+```text
+hinagata 0.1.0 listening on 127.0.0.1:7700
+```
+
+In another shell, create a model and watch the audit trail record it:
+
+```bash
+curl -s -H 'Authorization: Bearer dev-token' -H 'Content-Type: application/json' \
+  -X POST 127.0.0.1:7700/v1/models -d '{"name":"churn","description":"Churn classifier"}'
+curl -s -H 'Authorization: Bearer dev-token' 127.0.0.1:7700/v1/audit-events
+curl -s 127.0.0.1:7700/healthz
+```
+
+```text
+{"name":"churn","description":"Churn classifier","created_at_ms":1793897994203,"created_by":"static-token"}
+{"events":[{"seq":1,"at_ms":1793897994203,"actor":"static-token","action":"model.created","model":"churn","version":0,"before":"","after":"{\"name\":\"churn\",\"description\":\"Churn classifier\",\"created_at_ms\":1793897994203,\"created_by\":\"static-token\"}"}]}
+{"failing":[],"status":"ok"}
+```
+
+Registering a version needs its artifact first, and artifact bytes travel over
+gRPC only; see [Artifacts](#artifacts) and the service definition in
+`proto/hinagata/v1/`.
+
+## How it works
+
+```mermaid
+flowchart LR
+  U[upload artifact<br>by digest] --> R[register version:<br>signature, lineage, metrics]
+  R --> S[stages:<br>candidate, staging, production]
+  S -- approval hook<br>and gates --> D[signed deployment<br>descriptor]
+  D --> O[online service /<br>batch scoring job]
+  O --> M[prediction summaries,<br>labeled aggregates]
+  M --> A[drift and<br>quality alerts]
+```
+
+A **model** groups numbered, immutable **versions**. Each version pins one
+artifact by digest and fixes its typed **signature** and its **lineage** at
+registration. A version moves through **stages** under the caller's approval
+hook. A signed **deployment descriptor** tells the deployer or the batch
+runner how to run a version — Hinagata never runs models itself. Scoring sends
+back **prediction summaries** and, once labels arrive, **labeled aggregates**;
+every threshold crossed becomes a **drift alert** with its evidence.
+
+**Why not an external database?** Registry metadata lives in one embedded
+SQLite file: every write commits in one transaction with its audit event,
+immutability is enforced by schema triggers, and an air-gapped install needs
+no second service
+([ADR 0001](docs/decisions/0001-embedded-registry-store.md)).
 
 ## Run
 
@@ -30,7 +119,7 @@ Models and versions live in the caller's namespace, in one embedded database fil
 
 ## Signed manifests
 
-With `HINAGATA_SIGNING_KEY_FILE` (an Ed25519 seed as 64 hex characters) and `HINAGATA_SIGNING_KEY_ID`, `GetVersionManifest` returns a version's metadata and a detached signature over its manifest: namespace, model, version number, artifact digest and metadata digest. Anyone holding the public key can check, offline, that an artifact and its metadata came from this registry: `hinagata verify --keys trusted.json --envelope manifest.json --artifact model.onnx`. The format is in [docs/signatures.md](docs/signatures.md), so other verifiers need no Hinagata code. Without a key the call is refused. After an approved stage change, `GetPromotionAttestation` returns a signed attestation bound to the same artifact digest (approver, decision reference, stage): `hinagata verify --keys trusted.json --attestation attestation.json --artifact model.onnx` ([promotion](docs/promotion.md)).
+With `HINAGATA_SIGNING_KEY_FILE` (an Ed25519 seed as 64 hex characters) and `HINAGATA_SIGNING_KEY_ID`, `GetVersionManifest` returns a version's metadata and a detached signature over its manifest: namespace, model, version number, artifact digest and metadata digest. Anyone holding the public key can check, offline, that an artifact and its metadata came from this registry: `hinagata verify --keys trusted.json --envelope manifest.json --artifact model.onnx`. The format is in [docs/signatures.md](docs/signatures.md), so other verifiers need no Hinagata code. Without a key the call is refused.
 
 ## Deployment descriptors
 
@@ -59,6 +148,8 @@ A version can register a training baseline: per-feature bin edges and counts, pe
 
 Hinagata stores no predictions or labels. The caller joins labels to its own predictions and sends labeled aggregates ([format](docs/labeled-aggregate.md)): confusion counts and per-class score histograms for classifiers, error sums for regressors. Each gets accuracy, AUC and calibration error, or MAE and RMSE, and a metric past the version's quality thresholds is an alert in the drift alert stream.
 
+## API
+
 | HTTP | gRPC |
 | --- | --- |
 | `GET /v1/identity` | `GetIdentity` |
@@ -67,7 +158,6 @@ Hinagata stores no predictions or labels. The caller joins labels to its own pre
 | `POST /v1/models/{model}/versions`, `GET /v1/models/{model}/versions` | `RegisterVersion`, `ListVersions` |
 | `GET /v1/models/{model}/versions/{version}` | `GetVersion` |
 | `GET /v1/models/{model}/versions/{version}/manifest` | `GetVersionManifest` |
-| `GET /v1/models/{model}/versions/{version}/promotion-attestation` | `GetPromotionAttestation` |
 | `POST /v1/models/{model}/versions/{version}/online-descriptor`, `.../batch-descriptor` | `GetOnlineDescriptor`, `GetBatchDescriptor` |
 | gRPC only | `ImportVersion` |
 | `GET /v1/models/{model}/signature-compatibility?from_version=…&to_version=…` | `CheckSignatureCompatibility` |
@@ -85,9 +175,14 @@ Hinagata stores no predictions or labels. The caller joins labels to its own pre
 
 - `GET /healthz` answers 200 when the registry database and the artifact store both answer, and 503 naming the failing part otherwise. `GET /metrics` serves Prometheus text: build info, `hinagata_up`, and model, version, artifact and drift alert totals over all namespaces. Neither needs a credential.
 - `GET /v1/diagnostics` gives an authenticated caller a bundle for support: version, schema version, configuration (auth kind, artifact store kind, TLS), limits, health, and its namespace's totals. It carries no credentials, paths, bucket names or artifacts.
-- The `Dockerfile` builds one static binary into an otherwise empty image, with the builder pinned by digest. The server makes no network calls except to configured storage. CI runs the image with networking disabled. Release images are tagged with the version only; deploy by digest, never by a `latest` tag. See [Releases](RELEASING.md).
+- The `Dockerfile` builds one static binary into an otherwise empty image, with the builder pinned by digest. The server makes no network calls except to configured storage. CI runs the image with networking disabled.
 - `cargo deny check licenses` (`deny.toml`) gates dependencies: CI fails on any license not on the permissive list, so no copyleft code enters the default build.
 
-Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues for planned work.
+## Development
+
+`make validate` runs formatting and lints, `make test` the test suite, and
+`make test-integration` the integration tests. Decisions live under
+[docs/decisions/](docs/decisions/README.md), the agent workflow in
+[AGENTS.md](AGENTS.md), and release notes in [CHANGELOG.md](CHANGELOG.md).
 
 License: Apache-2.0.
