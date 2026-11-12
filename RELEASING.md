@@ -109,6 +109,35 @@ Pull requests and `workflow_dispatch` without a tag dry-run the same
 packaging path on that ref. Dry runs never build images, mint attestations,
 or touch a GitHub Release.
 
+## Tenkai product
+
+A tagged run pushes the image as `ghcr.io/sannrox/hinagata:<version>` (never
+`latest`) and attaches `hinagata-<version>-tenkai-kubernetes.tar.gz`: the
+[Kubernetes product](deploy/kubernetes/README.md) rendered with
+`scripts/render-tenkai-product.sh`, with the image and the profile's
+component pin set to the pushed digest. The family manifest lists the pushed
+image and the archive with their digests, and the archive is attested with
+the other assets. A re-run of a draft rebuilds and re-pushes the version tag;
+the attached product pins whatever that run pushed.
+
+The product ships no `imagePullSecrets`. The first tagged run creates the
+GHCR package; make that package public so environments can pull the digest
+without registry credentials. Later tags reuse the same package.
+
+The product provides one contract, `hinagata.registry`: the `hinagata.v1.Hinagata`
+gRPC service and its HTTP/JSON surface. Its version is separate from the crate
+version and lives in `deploy/kubernetes/tenkai.toml`. In the pull request that
+changes the surface, bump:
+
+- **major** when a caller written against the previous version breaks
+  (a removed method, field, or route, or a stricter requirement on requests);
+- **minor** for an addition a caller can ignore;
+- **patch** for a fix that leaves the surface as it was.
+
+Dependents declare `requires` on the contract at the minimum they are
+tested against; Tenkai holds their upgrade until a compatible hinagata is
+installed.
+
 ## Provenance
 
 Attestations record the workflow that built the artifacts, which is main's

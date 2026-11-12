@@ -175,7 +175,8 @@ Hinagata stores no predictions or labels. The caller joins labels to its own pre
 
 - `GET /healthz` answers 200 when the registry database and the artifact store both answer, and 503 naming the failing part otherwise. `GET /metrics` serves Prometheus text: build info, `hinagata_up`, and model, version, artifact and drift alert totals over all namespaces. Neither needs a credential.
 - `GET /v1/diagnostics` gives an authenticated caller a bundle for support: version, schema version, configuration (auth kind, artifact store kind, TLS), limits, health, and its namespace's totals. It carries no credentials, paths, bucket names or artifacts.
-- The `Dockerfile` builds one static binary into an otherwise empty image, with the builder pinned by digest. The server makes no network calls except to configured storage. CI runs the image with networking disabled.
+- The `Dockerfile` builds one static binary into an otherwise empty image, with the builder pinned by digest. The server makes no network calls except to configured storage. CI runs the image with networking disabled. Deploy by digest, never a `latest` tag.
+- Each signed release also carries a Tenkai product for Kubernetes that provides the `hinagata.registry` contract; see [deploy/kubernetes](deploy/kubernetes/README.md).
 - `cargo deny check licenses` (`deny.toml`) gates dependencies: CI fails on any license not on the permissive list, so no copyleft code enters the default build.
 
 ## Development
