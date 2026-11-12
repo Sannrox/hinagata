@@ -1,0 +1,23 @@
+# Only pods that declare themselves callers reach hinagata: label a caller's
+# pods `hinagata/caller: "true"` in the same namespace. Kubelet probes are
+# not subject to this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hinagata
+  labels:
+    app.kubernetes.io/name: hinagata
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hinagata
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              hinagata/caller: "true"
+      ports:
+        - protocol: TCP
+          port: 7700
